@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,17 +86,25 @@
 /* One queue slot = local bookkeeping + the exact wire message.
  *
  *   [ slot.len ][ slot.epoch ][ slot.msg ][ PCM payload ]
- *   \____________ local only ________/\____ goes on the wire ____/
+ *   \_____ local only ______/\____ goes on the wire ____/
  *
  * x.len and x.epoch are ring-internal: they exist so the consumer can find the next slot
  * and drop slots that belong to an older attachment. Only x.msg + payload are ever handed
- * to sendmsg -- see send_ring_peek(), which reports the wire span, not the slot span. */
+ * to sendmsg.
+ *
+ * The local-only prefix is offsetof(struct send_slot, msg), NOT sizeof(struct send_slot):
+ * the struct also contains the audio_msg that must go on the wire, so sizeof() would skip
+ * the wire header as well and transmit a headerless message. Use ANLAND_SLOT_LOCAL for
+ * every wire bound, and keep it in sync with the field order above. */
 struct send_slot {
     uint32_t         len;    /* total bytes of this slot, including this field */
     uint32_t         epoch;  /* attachment generation this slot belongs to */
-    struct audio_msg msg;
+    struct audio_msg msg;    /* first byte of the wire message */
     /* payload follows */
 };
+
+/* Bytes of the slot that are ring bookkeeping only. */
+#define ANLAND_SLOT_LOCAL   offsetof(struct send_slot, msg)
 
 struct send_ring {
     uint8_t           *buf;
@@ -177,8 +186,12 @@ struct anland_audio {
     int                    sock_fd;        /* -1 when detached; owned by the sender thread
                                             * for as long as it runs, closed by that thread
                                             * (or by the loop thread if it never started) */
-    int                    ctl_read;       /* sender thread wakes on this */
-    int                    ctl_write;      /* poked by the RT callback to request a flush */
+    /* Wake-up pipe for the SENDER thread: it is the only reader, and the RT callback (via
+     * sender_wake) or the loop thread pokes it to ask for a flush. It deliberately does NOT
+     * reach the PipeWire loop -- the loop thread has its own 1 s periodic tick (see
+     * on_tick), which is what services stop_requested. */
+    int                    ctl_read;       /* read by sender_thread only */
+    int                    ctl_write;      /* poked to wake sender_thread */
     _Atomic bool           sender_stop;
 
     /* ---- keep-alive payload, immutable after start --------------------------- */
@@ -280,13 +293,15 @@ static bool send_ring_peek(struct send_ring *r, size_t *slot_len, size_t *wire_o
     uint64_t head = atomic_load_explicit(&r->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
 
+    const size_t local = ANLAND_SLOT_LOCAL;   /* local-only prefix, NOT sizeof(slot) */
+
     if (head == tail)
         return false;
-    if ((size_t)(head - tail) < sizeof(struct send_slot))
+    if ((size_t)(head - tail) < local)
         return false;   /* the local header is not fully published yet */
 
     size_t start = (size_t)(tail & (r->size - 1));
-    uint8_t header[sizeof(struct send_slot)];
+    uint8_t header[ANLAND_SLOT_LOCAL];
     size_t first = r->size - start;
     if (first > sizeof(header))
         first = sizeof(header);
@@ -295,14 +310,17 @@ static bool send_ring_peek(struct send_ring *r, size_t *slot_len, size_t *wire_o
         memcpy(header + first, r->buf, sizeof(header) - first);
 
     struct send_slot slot;
-    memcpy(&slot, header, sizeof(slot));
+    memset(&slot, 0, sizeof(slot));   /* msg is not part of the local header */
+    memcpy(&slot, header, local);
 
-    if (slot.len < sizeof(slot) || (size_t)(head - tail) < slot.len)
+    /* A slot must at least carry the local header plus one whole wire header. */
+    if (slot.len < local + sizeof(struct audio_msg) ||
+        (size_t)(head - tail) < slot.len)
         return false;   /* not a whole slot yet: retry on the next pass */
 
     *slot_len = slot.len;
-    *wire_off = (start + sizeof(slot)) & (r->size - 1);
-    *wire_len = slot.len - sizeof(slot);
+    *wire_off = (start + local) & (r->size - 1);
+    *wire_len = slot.len - local;
     *epoch = slot.epoch;
     return true;
 }
@@ -355,8 +373,13 @@ static size_t ring_read(struct anland_audio *a, uint8_t *p, size_t n)
 
 /* ---- sender thread: the only place the Android socket is touched ---- */
 
-/* Poke the sender thread. Safe from any thread: one byte onto a non-blocking pipe, no
- * allocation and no sleeping. EAGAIN means a wake-up is already pending, which is enough. */
+/* Poke the sender thread so it drains the queue. Safe from any thread: one byte onto a
+ * non-blocking pipe, no allocation and no sleeping. EAGAIN means a wake-up is already
+ * pending, which is enough.
+ *
+ * This wakes the SENDER thread only -- it is the sole reader of ctl_read. It does not wake
+ * the PipeWire loop, so it must never be used to signal loop-thread work; the loop side is
+ * driven by the 1 s periodic tick. */
 static void sender_wake(struct anland_audio *a)
 {
     if (a->ctl_write < 0)
@@ -460,8 +483,12 @@ static void *sender_thread(void *data)
         }
 
         case SEND_DEAD:
+            /* Raise the flag for the loop thread and return. Do NOT call sender_wake()
+             * here: that pipe is read by this very thread, so it cannot wake the loop.
+             * The loop thread picks stop_requested up on its 1 s periodic tick
+             * (service_rt_state) and performs the detach. The sender is already gone by
+             * then, which detach_audio_fd_locked() handles through sender_started. */
             atomic_store_explicit(&a->stop_requested, true, memory_order_release);
-            sender_wake(a);   /* ask the loop thread to finish the detach */
             return NULL;
 
         case SEND_EMPTY:
