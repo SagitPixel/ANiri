@@ -227,12 +227,6 @@ static bool send_ring_init(struct send_ring *r, size_t size)
     return true;
 }
 
-static size_t send_ring_used(const struct send_ring *r)
-{
-    return (size_t)(atomic_load_explicit(&r->head, memory_order_acquire) -
-                    atomic_load_explicit(&r->tail, memory_order_relaxed));
-}
-
 /* Producer. Copies one whole message plus its local slot header, or reports failure so the
  * caller can count a drop. Never splits a message and never blocks. `epoch` is the
  * attachment generation the caller observed for this period. */
@@ -483,13 +477,13 @@ static void *sender_thread(void *data)
         }
 
         case SEND_DEAD:
-            /* Raise the flag for the loop thread and return. Do NOT call sender_wake()
-             * here: that pipe is read by this very thread, so it cannot wake the loop.
-             * The loop thread picks stop_requested up on its 1 s periodic tick
-             * (service_rt_state) and performs the detach. The sender is already gone by
+            /* Raise the flag for the loop thread and leave through the common exit. Do NOT
+             * call sender_wake() here: that pipe is read by this very thread, so it cannot
+             * wake the loop -- the loop thread picks stop_requested up on its 1 s periodic
+             * tick (service_rt_state) and performs the detach. The sender is already gone by
              * then, which detach_audio_fd_locked() handles through sender_started. */
             atomic_store_explicit(&a->stop_requested, true, memory_order_release);
-            return NULL;
+            goto out;
 
         case SEND_EMPTY:
         default:
@@ -504,9 +498,16 @@ static void *sender_thread(void *data)
         }
     }
 
-    /* No flush on the way out: a detach is not a place to deliver one last period of audio
+out:
+    /* The single exit path for every way this thread can end -- normal stop or SEND_DEAD.
+     * No flush on the way out: a detach is not a place to deliver one last period of audio
      * to a consumer that is going away, and waiting for the kernel here would only extend
-     * the join. Whatever is still queued is dropped by the detach path. */
+     * the join. Whatever is still queued is dropped by the detach path.
+     *
+     * This is the ONLY place sender_fd is closed on the running-thread path, which is what
+     * makes "exactly one close" hold: detach_audio_fd_locked() only pthread_join()s when
+     * sender_started is set, and the loop thread's own close(sender_fd) is reserved for the
+     * pthread_create() failure case where this thread never came into existence. */
     close(fd);
     return NULL;
 }
