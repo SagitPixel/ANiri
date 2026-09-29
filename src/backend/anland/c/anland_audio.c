@@ -100,8 +100,13 @@ struct send_slot {
 struct send_ring {
     uint8_t           *buf;
     size_t             size;      /* power of two */
-    _Atomic uint64_t   head;      /* producer publishes here */
-    _Atomic uint64_t   tail;      /* consumer publishes here */
+    /* Single-writer contract, which is what makes the queue lock-free: `head` is written
+     * ONLY by the realtime producer, `tail` ONLY by the sender thread. The loop thread may
+     * read `head` and advance `tail` when it drops published data on detach, but it must
+     * never write `head` -- doing so would race a push that is already in flight and
+     * desynchronise the counters (see detach_audio_fd_locked). */
+    _Atomic uint64_t   head;      /* producer-owned */
+    _Atomic uint64_t   tail;      /* consumer-owned */
 };
 
 struct anland_audio {
@@ -222,24 +227,26 @@ static bool send_ring_push(struct send_ring *r, uint32_t epoch,
                            const struct audio_msg *hdr,
                            const uint8_t *payload, size_t payload_len)
 {
-    uint8_t header[sizeof(struct send_slot)];
-    struct send_slot *slot = (struct send_slot *)header;
-    size_t total = sizeof(*slot) + payload_len;
+    /* A real struct, so its address is correctly aligned for its type and may be pointed
+     * at by an iovec. Casting a uint8_t array to struct send_slot * and dereferencing it
+     * would be undefined behaviour on any target that requires the alignment. */
+    struct send_slot slot;
+    size_t total = sizeof(slot) + payload_len;
     uint64_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
 
     if (total > r->size || (size_t)(head - tail) + total > r->size)
         return false;
 
-    slot->len = (uint32_t)total;
-    slot->epoch = epoch;
-    slot->msg = *hdr;
+    slot.len = (uint32_t)total;
+    slot.epoch = epoch;
+    slot.msg = *hdr;
 
     uint8_t *dst = r->buf;
     size_t start = (size_t)(head & (r->size - 1));
 
     struct iovec src[2] = {
-        { .iov_base = header, .iov_len = sizeof(*slot) },
+        { .iov_base = &slot, .iov_len = sizeof(slot) },
         { .iov_base = (void *)payload, .iov_len = payload_len },
     };
     size_t off = start;
@@ -361,8 +368,9 @@ static void sender_wake(struct anland_audio *a)
 
 /* Outcome of one attempt to hand the next queued slot to the socket. */
 enum send_result {
-    SEND_EMPTY = 0,   /* nothing to do: no slot (or only a stale one) is queued */
+    SEND_EMPTY = 0,   /* nothing queued: the caller should sleep */
     SEND_SENT,        /* one whole wire message was sent and the slot consumed */
+    SEND_DISCARDED,   /* a stale slot was dropped: make progress, keep draining */
     SEND_AGAIN,       /* kernel buffer full: the slot was kept for a later pass */
     SEND_DEAD,        /* consumer gone or framing broken: drop the attachment */
 };
@@ -382,8 +390,12 @@ static enum send_result sender_send_one(struct anland_audio *a, int fd)
         return SEND_EMPTY;
 
     if (epoch != atomic_load_explicit(&a->epoch, memory_order_acquire)) {
+        /* Produced for an attachment that is already gone (detach, reconnect or a PLAYBACK
+         * format change): drop it rather than send it to whoever is attached now. This is
+         * progress, not an empty queue, so the caller keeps draining instead of sleeping on
+         * a queue that still holds slots. */
         send_ring_consume(&a->send, slot_len);
-        return SEND_EMPTY;   /* stale slot dropped; caller re-checks the queue */
+        return SEND_DISCARDED;
     }
 
     /* The wire message is one contiguous run unless it wrapped the end of the queue, in
@@ -436,7 +448,8 @@ static void *sender_thread(void *data)
 
         switch (res) {
         case SEND_SENT:
-            continue;   /* more may be queued */
+        case SEND_DISCARDED:
+            continue;   /* more may be queued, or more stale slots to drop */
 
         case SEND_AGAIN: {
             /* Kernel send buffer full: wait for writability, still bounded so a stop
@@ -501,13 +514,23 @@ static void detach_audio_fd_locked(struct anland_audio *a)
     a->sock_fd = -1;
     atomic_store_explicit(&a->stop_requested, false, memory_order_relaxed);
 
-    /* Drop whatever is still queued. The sender no longer flushes on the way out (a
-     * detach must not push one last period at a consumer that is leaving), and the RT
-     * callback is already disarmed above, so nothing can be added after this point. The
-     * producer is the only writer of `head` and it is quiescent, so resetting both indices
-     * here is safe and gives the next attachment a completely empty queue. */
-    atomic_store_explicit(&a->send.head, 0, memory_order_release);
-    atomic_store_explicit(&a->send.tail, 0, memory_order_release);
+    /* Drop whatever has already been PUBLISHED: move tail up to head and nothing else.
+     * head belongs to the realtime producer alone and must never be written here.
+     * Disarming playback_ready above does not guarantee that a process callback which is
+     * already inside on_capture_process() has noticed, so a push may still be in flight:
+     *
+     *   RT:   head_old = load(head)   ... publish head_old + total
+     *   loop:                            store(head, 0)      <- would corrupt the counter
+     *
+     * Zeroing head would make that in-flight push publish `head_old + total` on top of a
+     * zeroed counter, which desynchronises the queue for every later attachment. Leaving
+     * head alone keeps the single-writer invariant, and the period that lands afterwards is
+     * tagged with the epoch this detach just moved past, so the next sender drops it (see
+     * sender_send_one) rather than sending it to the new consumer. */
+    {
+        uint64_t head = atomic_load_explicit(&a->send.head, memory_order_acquire);
+        atomic_store_explicit(&a->send.tail, head, memory_order_release);
+    }
 
     ring_reset(a);
     if (io)
@@ -539,9 +562,13 @@ static void on_capture_state_changed(void *data, enum pw_stream_state old,
  * block is spliced into a live stream.
  *
  * THIS RUNS ON THE PIPEWIRE REALTIME DATA THREAD (PW_STREAM_FLAG_RT_PROCESS) and is not
- * covered by the thread-loop lock. It therefore touches no file descriptor, no loop
- * object and no lock: only this stream's SPA buffers, immutable fields, the lock-free
- * queue, and atomics. Sending is the sender thread's job. */
+ * covered by the thread-loop lock. It never touches the Android socket, opens or closes
+ * anything, takes a lock, or calls into the loop: it works on this stream's SPA buffers,
+ * immutable fields, the lock-free queue and atomics, and hands the wake-up to the sender
+ * thread. Note the one syscall it does make -- sender_wake() writes a single byte to a
+ * non-blocking pipe -- so "touches no file descriptor" would be inaccurate; what is true
+ * is that the descriptor it pokes is owned by this object, always non-blocking (see
+ * pipe2() in anland_audio_start), and never the transport socket. */
 static void on_capture_process(void *data)
 {
     struct anland_audio *a = data;
@@ -1185,28 +1212,24 @@ int anland_audio_start(void)
         goto fail;
 
     /* Control pipe: the sender thread sleeps on the read end and the RT callback pokes the
-     * write end to ask for a flush. Both ends are non-blocking, so a poke from the
-     * realtime thread can never block. Nothing is ever pre-written into it: the sender
-     * reads it only when it is readable, so an empty pipe simply means "nothing to flush".
-     * The pipe is read directly rather than through a loop source, so the sender thread is
-     * the only reader and no loop callback can steal its wake-ups.
+     * write end to ask for a flush. Nothing is ever pre-written into it: the sender reads
+     * it only when it is readable, so an empty pipe simply means "nothing to flush". The
+     * pipe is read directly rather than through a loop source, so the sender thread is the
+     * only reader and no loop callback can steal its wake-ups.
      * Teardown uses the sender's idle timeout (SEND_IDLE_MS) plus an explicit stop flag
      * instead of piping a stop byte, which is why the pipe may be full of pokes without
-     * delaying a stop. */
+     * delaying a stop.
+     *
+     * pipe2() is used because the write end MUST end up non-blocking before any process
+     * callback can reach sender_wake(): a blocking write there could stall the realtime
+     * thread on a full pipe. Setting the flags separately and ignoring their failure would
+     * leave exactly that window, so a failure here is an initialisation failure. */
     {
         int fds[2];
-        if (pipe(fds) < 0)
+        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) < 0)
             goto fail;
         a->ctl_read = fds[0];
         a->ctl_write = fds[1];
-        for (int i = 0; i < 2; i++) {
-            int fl = fcntl(fds[i], F_GETFL, 0);
-            if (fl >= 0)
-                fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
-            int fdfl = fcntl(fds[i], F_GETFD, 0);
-            if (fdfl >= 0)
-                fcntl(fds[i], F_SETFD, fdfl | FD_CLOEXEC);
-        }
     }
 
     if (pw_thread_loop_start(a->loop) < 0)
