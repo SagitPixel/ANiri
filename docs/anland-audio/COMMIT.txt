@@ -1,4 +1,6 @@
 fix commit   ec9ef2fbee48b62c97a6b1d12b1aadbc10d912cb
              backend/anland: keep PipeWire speaker stream alive
-revision     89e6cebff4b39487a7df596e5705a9f35e59dc75
+revision 1   89e6cebff4b39487a7df596e5705a9f35e59dc75
              backend/anland: make the RT process callback actually realtime-safe
+revision 2   4d17eff997a0ddf9ab323eeb984de390a3fbf0e7
+             backend/anland: take the audio socket out of the realtime callback
