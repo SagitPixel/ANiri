@@ -6,3 +6,5 @@ revision 2   4d17eff997a0ddf9ab323eeb984de390a3fbf0e7
              backend/anland: take the audio socket out of the realtime callback
 revision 3   cab5b98fe04117dcfe834f761f164b49e91dbc2b
              backend/anland: fix playback queue framing, ownership and gating
+revision 4   bcc887ee8d9289463fa854a7d1c1d64fcd8363d3
+             backend/anland: keep the send queue head producer-owned and tidy the sender
