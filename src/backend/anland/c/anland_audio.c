@@ -4,6 +4,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,8 +30,11 @@
  * Sized for the worst case (stereo) so the ring never under-allocates. */
 #define MIC_RING_BYTES        (48000 * 2 * (int)sizeof(int16_t))
 #define MAX_DGRAM             (64 * 1024)
-/* Retry cadence after the PipeWire connection is lost (sound service restart, etc). */
-#define RECONNECT_SECS    1
+/* Retry cadence of the periodic tick (also the RT-event drain point). */
+#define TICK_SECS             1
+/* How long the sender thread waits for a wake-up when the playback queue is empty. It
+ * also bounds how long a stop request can go unnoticed, so detach never hangs. */
+#define SEND_IDLE_MS          100
 
 /* Plausibility bounds for a consumer-announced format; anything outside is ignored in
  * favour of the previous (or default) format instead of wrecking the stream. */
@@ -42,11 +47,19 @@
  * The Android consumer runs one AAudio playback stream per direction and only advances
  * it while PCM keeps arriving; without this its buffer underruns and the native stream
  * stops (which in turn leaves the PipeWire link -- and every app on it -- sitting in
- * paused forever). One short period of silence per PipeWire cycle keeps that native
+ * paused forever). One short block of silence per PipeWire cycle keeps that native
  * stream primed without adding audible latency or meaningful traffic. Only ever sent
  * while a consumer audio socket is attached. */
 #define KEEPALIVE_FRAMES      480
 #define KEEPALIVE_BYTES       (KEEPALIVE_FRAMES * MAX_AUDIO_CHANNELS * (int)sizeof(int16_t))
+
+/* Playback queue between the realtime process callback (producer) and the sender thread
+ * (consumer), one whole AUDIO_MSG_PCM message per slot with a 4-byte length prefix.
+ * 64 KiB is ~10 periods of 48 kHz/1024-frame stereo PCM: deep enough that a normal
+ * scheduling hiccup never drops audio, shallow enough to bound the queued latency. When
+ * it does fill up a whole message is dropped and counted, never split. Must stay a power
+ * of two. */
+#define SEND_RING_BYTES       (64 * 1024)
 
 /* Edge-event bits published by the realtime process callback and consumed (logged) by
  * the loop thread. The callback must not do stdio, so it only sets a bit with release
@@ -54,16 +67,42 @@
 #define AUDIO_EV_FIRST_PCM    (1u << 0)   /* first PCM forwarded on this attachment */
 #define AUDIO_EV_KEEPALIVE_ON (1u << 1)   /* silence keep-alive started */
 #define AUDIO_EV_STREAMING    (1u << 2)   /* keep-alive -> real PCM transition */
-#define AUDIO_EV_SEND_FAIL    (1u << 3)   /* sendmsg reported a non-transient error */
-#define AUDIO_EV_SHORT_WRITE  (1u << 4)   /* sendmsg did not write the whole message */
+#define AUDIO_EV_SEND_FAIL    (1u << 3)   /* sender thread reported a send error */
+#define AUDIO_EV_SHORT_WRITE  (1u << 4)   /* sender thread reported a partial write */
+#define AUDIO_EV_QUEUE_FULL   (1u << 5)   /* playback queue overflowed, message dropped */
+
+/* ---- single-producer / single-consumer byte queue -------------------------------
+ *
+ * Producer: on_capture_process() on the PipeWire realtime data thread.
+ * Consumer: sender_thread() -- the only thread that ever touches the Android socket.
+ *
+ * head/tail are monotonically increasing byte counters, only ever written by one side
+ * each, so they are atomic while the buffer itself needs no synchronisation beyond the
+ * acquire/release pairing: the producer stores data and then publishes head with release,
+ * the consumer loads head with acquire before reading that data (and vice versa for
+ * tail). No lock, no allocation, and no file descriptor is shared with the RT thread. */
+
+/* First header field of every queued slot: the AUDIO_MSG_PCM header, so a slot can be
+ * handed to sendmsg by pointing straight at the queue. */
+struct send_slot {
+    uint32_t       len;    /* total bytes of this slot including this field */
+    struct audio_msg msg;
+};
+
+struct send_ring {
+    uint8_t           *buf;
+    size_t             size;      /* power of two */
+    _Atomic uint64_t   head;      /* producer publishes here */
+    _Atomic uint64_t   tail;      /* consumer publishes here */
+};
 
 struct anland_audio {
     struct pw_thread_loop *loop;
     struct pw_context     *context;
     struct pw_core        *core;
     struct spa_hook        core_listener;
-    struct spa_source     *reconnect_timer;
-    bool                   pw_connected;   /* core + streams are up */
+    struct spa_source     *tick_timer;
+    bool                   pw_connected;   /* core + streams are up (loop thread only) */
 
     struct pw_stream      *capture;   /* virtual Audio/Sink  -> socket (playback) */
     struct spa_hook        capture_listener;
@@ -77,54 +116,61 @@ struct anland_audio {
     /* Requested buffer (frames) per stream from the consumer's latency preset;
      * 0 = let PipeWire choose the graph quantum. Applied as node.latency. */
     uint32_t               play_quantum, cap_quantum;
+    /* PAST-TENSE playback format gate, loop thread only: set once a
+     * AUDIO_MSG_FORMAT with AUDIO_ROLE_PLAYBACK has been accepted on the current
+     * attachment. It is what arms keepalive_len. A new attachment clears it. */
+    bool                   play_format_known;
 
-    /* ---- transport, loop thread only ---------------------------------------- */
-    int                    audio_fd;  /* owned duplicate; -1 when detached */
-    struct spa_source     *io;        /* loop io source watching audio_fd for reads */
-
-    /* Wake-up pipe used by the realtime process callback to ask the loop thread for a
-     * detach. Written from the RT thread (one non-blocking byte), drained on the loop
-     * thread; the loop thread owns both descriptors. */
-    int                    notify_read, notify_write;
-    struct spa_source     *notify;
-
-    /* Digital-silence keep-alive payload: constant after start, only ever read by the
-     * realtime process callback, so it needs no synchronisation. */
-    uint8_t                silence[KEEPALIVE_BYTES];
-
-    /* ---- state shared with the realtime process callback -------------------- */
-    /* The speaker stream is the only stream created with PW_STREAM_FLAG_RT_PROCESS, so
-     * its process callback runs on the PipeWire realtime data thread and is NOT covered
-     * by the thread-loop lock. Everything it touches lives in this block and is either
-     * immutable after start (silence[] above) or atomic. Kept together so the RT thread
-     * does not bounce cache lines with the loop thread's mutable state.
-     *   keepalive_len   silence payload length for the announced format (0 = disabled)
-     *   stop_requested  the consumer died / framing broke; the loop thread must drop it
-     *   detach_serial   attachment generation that stop_requested refers to
-     *   events          RT -> loop edge events, drained by the periodic tick
-     *   last_errno      errno captured at the failing sendmsg, for the deferred log
-     *   pcm_seen        RT-private: real PCM was already forwarded on this attachment
-     *   keepalive_on    RT-private: silence is currently being fed                  */
-    _Atomic size_t         keepalive_len;
-    _Atomic bool           stop_requested;
-    _Atomic uint32_t       attach_serial;   /* bumped on every successful attach */
-    _Atomic uint32_t       detach_serial;   /* attachment stop_requested refers to */
-    _Atomic uint32_t       events;
-    _Atomic int            last_errno;
-    bool                   pcm_seen;
-    bool                   keepalive_on;
-
-    /* ---- mic ring + loop-thread-only scratch --------------------------------- */
+    /* ---- mic path, loop thread only ----------------------------------------- */
+    /* The local end of the audio socketpair, watched by `io` for mic PCM and format
+     * announcements. The sender thread never touches this one: it owns its own duplicate
+     * (`sock_fd`). */
+    int                    audio_fd;
+    struct spa_source     *io;
     /* on_audio_readable() (loop thread) is the only writer and on_source_process()
      * (also loop thread, because the mic stream deliberately does NOT use
-     * PW_STREAM_FLAG_RT_PROCESS) the only reader, so the ring needs no synchronisation
+     * PW_STREAM_FLAG_RT_PROCESS) the only reader, so this ring needs no synchronisation
      * -- the original single-threaded design is preserved. */
     uint8_t               *ring;
     size_t                 ring_size, ring_head, ring_tail, ring_fill;
 
-    /* Silence length in the announced format, mirrored into keepalive_len for the RT
-     * callback under the thread-loop lock. Loop thread only. */
-    size_t                 silence_bytes;
+    /* ---- playback queue, shared between exactly two threads ------------------ */
+    struct send_ring       send;
+    /* Byte length of one silence block in the announced format, published to the RT
+     * callback. 0 means "no playback consumer attached / no PLAYBACK format yet", which
+     * is also the gate that stops the RT callback from enqueueing anything. */
+    _Atomic size_t         keepalive_len;
+    /* Attachment generation. Bumped (release) on every attach, detach and accepted
+     * PLAYBACK format, after the corresponding keepalive_len store. The RT callback
+     * caches it and resets its private state whenever it changes, so a detach/reconnect
+     * between two process cycles is still observed. */
+    _Atomic uint32_t       epoch;
+    /* RT -> loop edge events, drained by the periodic tick. */
+    _Atomic uint32_t       events;
+    /* errno captured by the sender thread for the deferred log. */
+    _Atomic int            send_errno;
+    /* Set by the sender thread when it gives up (consumer gone / framing broken); the
+     * loop thread tears the attachment down in response. */
+    _Atomic bool           stop_requested;
+
+    /* ---- sender thread ------------------------------------------------------- */
+    /* Owned by the loop thread: created in attach(), joined in detach_finish(). */
+    pthread_t              sender;
+    bool                   sender_started;
+    int                    sock_fd;        /* -1 when detached; owned by the sender thread
+                                            * for as long as it runs, closed by that thread
+                                            * (or by the loop thread if it never started) */
+    int                    ctl_read;       /* sender thread wakes on this */
+    int                    ctl_write;      /* poked by the RT callback to request a flush */
+    _Atomic bool           sender_stop;
+
+    /* ---- keep-alive payload, immutable after start --------------------------- */
+    uint8_t                silence[KEEPALIVE_BYTES];
+
+    /* ---- RT callback private state, reset via `epoch` ------------------------ */
+    uint32_t               rt_epoch_seen;  /* epoch this RT state belongs to */
+    bool                   rt_pcm_seen;
+    bool                   rt_keepalive_on;
 
     uint8_t                rx[MAX_DGRAM];
 };
@@ -138,7 +184,104 @@ static const struct spa_pod *build_format(struct spa_pod_builder *bld,
                                           uint32_t rate, uint32_t channels);
 static void set_latency(struct pw_stream *stream, uint32_t quantum, uint32_t rate);
 
-/* ---- mic ring buffer (single-threaded: loop thread only) ---- */
+/* ---- send queue (SPSC, lock-free) ---- */
+
+static bool send_ring_init(struct send_ring *r, size_t size)
+{
+    r->buf = malloc(size);
+    if (!r->buf)
+        return false;
+    r->size = size;
+    atomic_store(&r->head, 0);
+    atomic_store(&r->tail, 0);
+    return true;
+}
+
+static size_t send_ring_used(const struct send_ring *r)
+{
+    return (size_t)(atomic_load_explicit(&r->head, memory_order_acquire) -
+                    atomic_load_explicit(&r->tail, memory_order_relaxed));
+}
+
+/* Producer. Copies one whole message plus its 4-byte length prefix, or reports failure so
+ * the caller can count a drop. Never splits a message and never blocks. */
+static bool send_ring_push(struct send_ring *r, const struct audio_msg *hdr,
+                           const uint8_t *payload, size_t payload_len)
+{
+    size_t total = sizeof(uint32_t) + sizeof(*hdr) + payload_len;
+    uint64_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+
+    if (total > r->size || (size_t)(head - tail) + total > r->size)
+        return false;
+
+    uint32_t len = (uint32_t)total;
+    uint8_t *dst = r->buf;
+    size_t start = (size_t)(head & (r->size - 1));
+
+    struct iovec src[3] = {
+        { .iov_base = &len, .iov_len = sizeof(len) },
+        { .iov_base = (void *)hdr, .iov_len = sizeof(*hdr) },
+        { .iov_base = (void *)payload, .iov_len = payload_len },
+    };
+    size_t off = start;
+    for (size_t i = 0; i < 3; i++) {
+        const uint8_t *p = src[i].iov_base;
+        size_t n = src[i].iov_len;
+        if (n > r->size - off) {
+            size_t first = r->size - off;
+            memcpy(dst + off, p, first);
+            memcpy(dst, p + first, n - first);
+        } else {
+            memcpy(dst + off, p, n);
+        }
+        off = (off + n) & (r->size - 1);
+    }
+
+    atomic_store_explicit(&r->head, head + total, memory_order_release);
+    return true;
+}
+
+/* Consumer: locate the next whole slot. Returns false when the queue is empty (or holds a
+ * slot that is still being published), otherwise *off is the absolute byte offset of the
+ * slot start and *len its total length. The slot may wrap the end of the buffer, so the
+ * caller works from the offset, not from a pointer. Valid until send_ring_consume(). */
+static bool send_ring_peek(struct send_ring *r, size_t *off, size_t *len)
+{
+    uint64_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+
+    if (head == tail)
+        return false;
+    if ((size_t)(head - tail) < sizeof(struct send_slot))
+        return false;   /* the length prefix is not fully published yet */
+
+    size_t start = (size_t)(tail & (r->size - 1));
+    uint32_t len32;
+    if (sizeof(len32) > r->size - start) {
+        /* The length prefix itself straddles the wrap. */
+        size_t first = r->size - start;
+        memcpy(&len32, r->buf + start, first);
+        memcpy((uint8_t *)&len32 + first, r->buf, sizeof(len32) - first);
+    } else {
+        memcpy(&len32, r->buf + start, sizeof(len32));
+    }
+
+    if (len32 < sizeof(struct send_slot) || (size_t)(head - tail) < len32)
+        return false;   /* not a whole slot yet: retry on the next pass */
+
+    *off = start;
+    *len = len32;
+    return true;
+}
+
+static void send_ring_consume(struct send_ring *r, size_t len)
+{
+    uint64_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    atomic_store_explicit(&r->tail, tail + len, memory_order_release);
+}
+
+/* ---- mic ring buffer (loop thread only) ---- */
 
 static void ring_reset(struct anland_audio *a)
 {
@@ -178,72 +321,147 @@ static size_t ring_read(struct anland_audio *a, uint8_t *p, size_t n)
     return got;
 }
 
-/* The caller holds the thread-loop lock, or is executing on that loop. The io
- * source owns audio_fd, so destroying it also closes the duplicated descriptor. */
+/* ---- sender thread: the only place the Android socket is touched ---- */
+
+/* Poke the sender thread. Safe from any thread: one byte onto a non-blocking pipe, no
+ * allocation and no sleeping. EAGAIN means a wake-up is already pending, which is enough. */
+static void sender_wake(struct anland_audio *a)
+{
+    if (a->ctl_write < 0)
+        return;
+    const uint8_t b = 1;
+    ssize_t n = write(a->ctl_write, &b, sizeof(b));
+    (void)n;
+}
+
+/* Send one queued message. Returns 0 when the slot was fully sent (and consumed),
+ * -EAGAIN when the kernel had no room (slot kept for a later pass), -EPIPE when the
+ * consumer is gone and the attachment should be dropped. */
+static int sender_send_one(struct anland_audio *a, int fd)
+{
+    size_t off = 0, len = 0;
+    if (!send_ring_peek(&a->send, &off, &len))
+        return 0;
+
+    /* One slot is one whole AUDIO_MSG_PCM message. It is a single contiguous run unless it
+     * wrapped the end of the queue, in which case two iovecs describe it and sendmsg()
+     * still puts exactly one message on the socket -- SEQPACKET framing is preserved. */
+    struct iovec iov[2];
+    size_t n_iov = 1;
+    iov[0].iov_base = a->send.buf + off;
+    iov[0].iov_len = len;
+    if (off + len > a->send.size) {
+        iov[0].iov_len = a->send.size - off;
+        iov[1].iov_base = a->send.buf;
+        iov[1].iov_len = len - iov[0].iov_len;
+        n_iov = 2;
+    }
+    struct msghdr m = { .msg_iov = iov, .msg_iovlen = n_iov };
+
+    ssize_t n = sendmsg(fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return -EAGAIN;   /* keep the slot, let the queue push back */
+        if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
+            return -EPIPE;
+        atomic_store_explicit(&a->send_errno, errno, memory_order_relaxed);
+        atomic_fetch_or_explicit(&a->events, AUDIO_EV_SEND_FAIL, memory_order_release);
+        return -EPIPE;   /* unknown failure: drop the attachment, do not spin on it */
+    }
+    if (n != (ssize_t)len) {
+        /* One whole message per AUDIO_MSG_PCM on a message socket: a short write means the
+         * framing can no longer be trusted. */
+        atomic_fetch_or_explicit(&a->events, AUDIO_EV_SHORT_WRITE, memory_order_release);
+        return -EPIPE;
+    }
+    send_ring_consume(&a->send, len);
+    return 0;
+}
+
+/* Owns the transport fd for its whole lifetime. Exits only after the loop thread has
+ * signalled a stop, so the loop thread can close/discard the fd immediately after the
+ * join without any window in which this thread (or the RT callback) could still use it. */
+static void *sender_thread(void *data)
+{
+    struct anland_audio *a = data;
+    const int fd = a->sock_fd;
+    uint8_t drain[64];
+
+    while (!atomic_load_explicit(&a->sender_stop, memory_order_acquire)) {
+        int res = 0;
+        while (!atomic_load_explicit(&a->sender_stop, memory_order_acquire) &&
+               (res = sender_send_one(a, fd)) == 0)
+            ;   /* drain the queue */
+
+        if (res == -EPIPE) {
+            atomic_store_explicit(&a->stop_requested, true, memory_order_release);
+            sender_wake(a);   /* ask the loop thread to finish the detach */
+            break;
+        }
+        if (res == -EAGAIN) {
+            /* Kernel send buffer full: wait for writability, still bounded so a stop
+             * request is never missed for long. */
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+            poll(&pfd, 1, SEND_IDLE_MS);
+            continue;
+        }
+
+        /* Queue empty: sleep until woken, or until the idle timeout re-checks stop. */
+        struct pollfd pfd = { .fd = a->ctl_read, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, SEND_IDLE_MS) > 0 && (pfd.revents & POLLIN)) {
+            ssize_t n = read(a->ctl_read, drain, sizeof(drain));
+            (void)n;
+        }
+    }
+
+    /* Last flush so a stop request does not silence an already queued period. */
+    while (sender_send_one(a, fd) == 0)
+        ;
+    close(fd);
+    return NULL;
+}
+
+/* ---- transport attach / detach (loop thread; the caller holds the loop lock) ---- */
+
+/* The io source owns the *local* audio_fd, so destroying it also closes it; the sender
+ * thread owns the duplicate it was handed and closes that one itself. */
 static void detach_audio_fd_locked(struct anland_audio *a)
 {
     struct spa_source *io = a->io;
     a->io = NULL;
     a->audio_fd = -1;
-    /* Publish "no keep-alive" first: the realtime callback gates on keepalive_len alone,
-     * so it can never send a payload whose length was not published for this attachment. */
+
+    /* Disarm the keep-alive BEFORE the sender is torn down, so the RT callback cannot
+     * enqueue a fresh period for a consumer we are about to forget. The epoch bump makes
+     * the RT callback reset its private state even if it never observed the 0. */
     atomic_store_explicit(&a->keepalive_len, 0, memory_order_release);
+    atomic_fetch_add_explicit(&a->epoch, 1, memory_order_release);
+    a->play_format_known = false;
+
+    if (a->sender_started) {
+        atomic_store_explicit(&a->sender_stop, true, memory_order_release);
+        sender_wake(a);
+        pthread_join(a->sender, NULL);   /* bounded: the sender polls with SEND_IDLE_MS */
+        a->sender_started = false;
+    } else if (a->sock_fd >= 0) {
+        close(a->sock_fd);   /* never started, so nobody else can own it */
+    }
+    a->sock_fd = -1;
     atomic_store_explicit(&a->stop_requested, false, memory_order_relaxed);
-    a->pcm_seen = false;
-    a->keepalive_on = false;
+
+    /* Drain anything the sender left behind (queue is empty after the join; this also
+     * clears the case where the sender never started). */
+    send_ring_consume(&a->send, send_ring_used(&a->send));
+
     ring_reset(a);
     if (io)
         pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), io);
 }
 
-/* Ask the loop thread to drop the transport. Called from the realtime process callback,
- * where destroying a loop source is not allowed, so this only raises an atomic flag and
- * pokes a pipe: write(2) of one byte onto a non-blocking pipe is a plain syscall with no
- * allocation and no sleeping, and is the documented way to wake an event loop from
- * another thread. PipeWire exposes no API that is documented as safe to call from a
- * process callback on the data thread (pw_loop_update_timer() included), so an explicit
- * byte pipe is used instead of reaching into the loop implementation.
- * The failing attachment's serial is remembered so a detach requested against a dead
- * socket can never tear down a socket installed in the meantime. */
-static void defer_detach(struct anland_audio *a)
-{
-    if (atomic_exchange_explicit(&a->stop_requested, true, memory_order_relaxed))
-        return;   /* already asked; the loop thread owns the rest */
-    atomic_store_explicit(&a->detach_serial,
-                          atomic_load_explicit(&a->attach_serial, memory_order_relaxed),
-                          memory_order_relaxed);
-    if (a->notify_write >= 0) {
-        const uint8_t b = 1;
-        ssize_t n = write(a->notify_write, &b, sizeof(b));
-        (void)n;   /* EAGAIN means a wake-up is already pending, which is enough */
-    }
-}
-
-/* Loop thread: consume the wake-up byte and perform the deferred detach. */
-static void on_notify(void *data, int fd, uint32_t mask)
-{
-    struct anland_audio *a = data;
-    uint8_t buf[64];
-    (void)mask;
-    if (fd != a->notify_read)
-        return;
-    ssize_t n = read(fd, buf, sizeof(buf));
-    (void)n;
-
-    if (!atomic_load_explicit(&a->stop_requested, memory_order_acquire))
-        return;
-    atomic_store_explicit(&a->stop_requested, false, memory_order_relaxed);
-    if (!a->io ||
-        atomic_load_explicit(&a->detach_serial, memory_order_relaxed) !=
-            atomic_load_explicit(&a->attach_serial, memory_order_relaxed))
-        return;   /* already replaced (or dropped) by a newer attachment */
-    detach_audio_fd_locked(a);
-}
-
-/* ---- stream process callbacks (run on the PipeWire thread loop) ---- */
+/* ---- stream process callbacks ---- */
 
 /* Logs the paused/streaming/error transitions that matter when the speaker graph will
- * not leave "paused". Not per-buffer, so it is safe on the loop thread. */
+ * not leave "paused". Runs on the loop thread. */
 static void on_capture_state_changed(void *data, enum pw_stream_state old,
                                      enum pw_stream_state state, const char *error)
 {
@@ -253,25 +471,21 @@ static void on_capture_state_changed(void *data, enum pw_stream_state old,
             error ? ": " : "", error ? error : "");
 }
 
-/* Desktop audio captured from the default sink's monitor -> push to the socket so
- * the consumer plays it.
+/* Desktop playback PCM -> playback queue, drained by the sender thread.
  *
- * The Android consumer owns a real AAudio playback stream that only advances while
- * PCM keeps arriving; if it ever runs dry it stops, and the PipeWire node it is fed
- * from is then left permanently paused -- apps on the link never leave "paused" and
- * the graph never reaches streaming. So a cycle with no captured PCM (nothing produced
- * yet, or a genuinely quiet period) still sends one short block of digital silence in
- * the negotiated format. Real PCM always wins: whenever the graph produced a period we
- * forward exactly that period and nothing else, so silence never displaces audio and no
- * fixed-size block is spliced into a live stream. Only ever sent while a consumer audio
- * socket is attached and only after that consumer announced its PLAYBACK format.
- * Dropped (still drained) while detached.
+ * The Android consumer owns a real AAudio playback stream that only advances while PCM
+ * keeps arriving; if it ever runs dry it stops, and the PipeWire node it is fed from is
+ * then left permanently paused -- apps on the link never leave "paused" and the graph
+ * never reaches streaming. So a cycle with no captured PCM (nothing produced yet, or a
+ * genuinely quiet period) still queues one short block of digital silence in the
+ * announced format. Real PCM always wins: whenever the graph produced a period we forward
+ * exactly that period and nothing else, so silence never displaces audio and no fixed-size
+ * block is spliced into a live stream.
  *
  * THIS RUNS ON THE PIPEWIRE REALTIME DATA THREAD (PW_STREAM_FLAG_RT_PROCESS) and is not
- * covered by the thread-loop lock, so it must not take locks, allocate, log, or call
- * into the loop. Everything it touches is either read-only here (silence[], which is
- * written once before the stream is connected) or atomic; observable state changes are
- * published as edge bits in `events` for the loop thread to log. */
+ * covered by the thread-loop lock. It therefore touches no file descriptor, no loop
+ * object and no lock: only this stream's SPA buffers, immutable fields, the lock-free
+ * queue, and atomics. Sending is the sender thread's job. */
 static void on_capture_process(void *data)
 {
     struct anland_audio *a = data;
@@ -285,85 +499,69 @@ static void on_capture_process(void *data)
         return;
     }
 
+    /* A new attachment (or a fresh PLAYBACK format) invalidates the RT-private state, so
+     * a consumer that reconnected between two cycles is still handled correctly. */
+    uint32_t epoch = atomic_load_explicit(&a->epoch, memory_order_acquire);
+    if (epoch != a->rt_epoch_seen) {
+        a->rt_epoch_seen = epoch;
+        a->rt_pcm_seen = false;
+        a->rt_keepalive_on = false;
+    }
+
     const uint8_t *payload = NULL;
     size_t size = 0;
 
     if (d->data && d->chunk->size > 0) {
-        /* Real PCM (or upstream silence) at the graph's current period. Sending exactly
+        /* Real PCM (or upstream silence) at the graph's current period. Queueing exactly
          * what was dequeued keeps byte counts identical to the plain pass-through path,
          * so no fixed-size silence is ever spliced into a live stream -- no added
          * latency, no A/V drift. */
         payload = (uint8_t *)d->data + d->chunk->offset;
         size = d->chunk->size;
         uint32_t ev = AUDIO_EV_FIRST_PCM;
-        if (a->keepalive_on)
+        if (a->rt_keepalive_on)
             ev = AUDIO_EV_STREAMING;      /* silence -> real PCM transition */
-        else if (a->pcm_seen)
+        else if (a->rt_pcm_seen)
             ev = 0;                       /* steady state: nothing to report */
         atomic_fetch_or_explicit(&a->events, ev, memory_order_release);
-        a->keepalive_on = false;
-        a->pcm_seen = true;
+        a->rt_keepalive_on = false;
+        a->rt_pcm_seen = true;
     } else {
-        /* No captured PCM at all this cycle: the graph is either not producing yet or has
-         * genuinely gone quiet. Feed the consumer one short block of digital silence in
-         * the announced format so its native playback stream stays primed and the node
-         * can reach streaming instead of sitting paused forever. keepalive_len is 0 until
-         * a consumer announced its PLAYBACK format, which is exactly the gate we want.
-         * The payload lives in this object and is never written here, so the pointer stays
-         * valid; the length is atomic. */
+        /* No captured PCM at all this cycle. keepalive_len is 0 unless a consumer is
+         * attached AND has announced its PLAYBACK format, which is exactly the gate that
+         * keeps us from queueing silence for nobody. The payload lives in this object and
+         * is never written here, so the pointer stays valid; the length is atomic. */
         size = atomic_load_explicit(&a->keepalive_len, memory_order_acquire);
-        if (size > 0) {
+        if (size > 0 && size <= sizeof(a->silence)) {
             payload = a->silence;
-            if (!a->keepalive_on) {
+            if (!a->rt_keepalive_on) {
                 atomic_fetch_or_explicit(&a->events, AUDIO_EV_KEEPALIVE_ON,
                                          memory_order_release);
-                a->keepalive_on = true;
+                a->rt_keepalive_on = true;
             }
+        } else {
+            size = 0;
         }
     }
 
     if (payload) {
         struct audio_msg h = { .type = AUDIO_MSG_PCM, .size = (uint32_t)size };
-        struct iovec iov[2] = {
-            { .iov_base = &h, .iov_len = sizeof(h) },
-            { .iov_base = (void *)payload, .iov_len = size },
-        };
-        struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
-        /* MSG_DONTWAIT makes this a non-blocking send: it never waits for socket buffer
-         * space. It is still a syscall that takes the socket lock and allocates an skb
-         * (from a per-CPU cache at this message size), so it is not lock-free in the
-         * strictest sense -- but it never sleeps, and it is the same pattern the upstream
-         * Anland bridge uses on this path. One whole message per period; drop on EAGAIN. */
-        ssize_t n = sendmsg(a->audio_fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                /* transient back-pressure: skip this period */
-            } else if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
-                defer_detach(a);   /* consumer went away */
-            } else {
-                /* Keep the errno for the deferred log; the loop thread cannot know it. */
-                atomic_store_explicit(&a->last_errno, errno, memory_order_relaxed);
-                atomic_fetch_or_explicit(&a->events, AUDIO_EV_SEND_FAIL,
-                                         memory_order_release);
-            }
-        } else if (n != (ssize_t)(sizeof(h) + size)) {
-            /* The protocol carries one whole message per AUDIO_MSG_PCM and the socket is a
-             * message socket, so a short write means the framing is no longer reliable. */
-            atomic_fetch_or_explicit(&a->events, AUDIO_EV_SHORT_WRITE, memory_order_release);
-            defer_detach(a);
-        }
+        if (!send_ring_push(&a->send, &h, payload, size))
+            atomic_fetch_or_explicit(&a->events, AUDIO_EV_QUEUE_FULL, memory_order_release);
+        else
+            sender_wake(a);
     }
     pw_stream_queue_buffer(a->capture, b);
 }
 
-/* Fill the virtual mic source from the ring buffer (fed by Android). Silence-pads
- * when the ring underruns or while detached, so the source never glitches/vanishes.
+/* Fill the virtual mic source from the ring buffer (fed by Android). Silence-pads when the
+ * ring underruns or while detached, so the source never glitches/vanishes.
  *
  * The mic stream is deliberately created WITHOUT PW_STREAM_FLAG_RT_PROCESS, so this runs
- * on the PipeWire thread loop -- the same thread as on_audio_readable(), which is the
- * only writer of the ring. The ring therefore stays single-threaded exactly as designed
- * and needs no lock. Keep it that way: adding RT_PROCESS here would introduce a data
- * race on ring_head/ring_tail/ring_fill without a lock-free ring rewrite. */
+ * on the PipeWire thread loop -- the same thread as on_audio_readable(), which is the only
+ * writer of the ring. The ring therefore stays single-threaded exactly as designed and
+ * needs no lock. Keep it that way: adding RT_PROCESS here would introduce a data race on
+ * ring_head/ring_tail/ring_fill without a lock-free ring rewrite. */
 static void on_source_process(void *data)
 {
     struct anland_audio *a = data;
@@ -403,21 +601,21 @@ static const struct pw_stream_events source_events = {
     .process = on_source_process,
 };
 
-/* Apply a consumer-announced format. The virtual device stays continuously online
- * and is hot-plugged (disconnect + reconnect) ONLY when the format actually changes
- * versus what the stream is currently running -- an unchanged announcement (the common
- * case, including every consumer reconnect that re-sends the same format) is a no-op,
- * so the node never churns and plasma-pa keeps resolving the default sink/source.
+/* Apply a consumer-announced format. The virtual device stays continuously online and is
+ * hot-plugged (disconnect + reconnect) ONLY when the format actually changes versus what
+ * the stream is currently running -- an unchanged announcement (the common case, including
+ * every consumer reconnect that re-sends the same format) is a no-op, so the node never
+ * churns and plasma-pa keeps resolving the default sink/source.
  *
- * Defaults are role-correct: a field left 0 means "device default", which must equal
- * the value the stream was built with, otherwise the comparison below would treat an
- * unset field as a change and re-plug on every announcement. (One bug was a CAPTURE
- * announce with channels==0 defaulting to 2, never matching the mono source.)
+ * Defaults are role-correct: a field left 0 means "device default", which must equal the
+ * value the stream was built with, otherwise the comparison below would treat an unset
+ * field as a change and re-plug on every announcement. (One bug was a CAPTURE announce
+ * with channels==0 defaulting to 2, never matching the mono source.)
  *
  * Every change is applied IN PLACE -- the node object (anland-speaker / anland-mic) is
  * never destroyed, so WirePlumber/plasma-pa keep their default reference and never log
- * "No object for name anland-speaker". A rate/channels change renegotiates the port
- * format via pw_stream_update_params(); a quantum-only change (AAudio's framesPerBurst
+ * "No object for name anland-speaker". A rate/channels change renegotiates the port format
+ * via pw_stream_update_params(); a quantum-only change (AAudio's framesPerBurst
  * legitimately varies between opens) just updates node.latency. Neither disconnects.
  *
  * Runs on the loop thread, so the pw_stream calls are safe. */
@@ -430,29 +628,35 @@ static bool valid_format(const struct audio_format *f)
            f->quantum <= MAX_AUDIO_QUANTUM;
 }
 
-/* Bytes of S16 silence the keep-alive path hands the consumer when a cycle produced no
- * PCM at all, published to the realtime callback through keepalive_len.
- *
+/* Bytes of S16 silence the keep-alive path queues when a cycle produced no PCM at all.
  * The length is derived from the announced quantum but is deliberately CLAMPED to
- * KEEPALIVE_FRAMES (480 frames ~= 10 ms at 48 kHz): the payload is a small priming
- * block, not a whole negotiated period. So it is not "exactly one AAudio burst" when the
- * consumer asks for a larger quantum -- do not describe it that way. Raising the cap
- * would mean sending proportionally more silence per cycle for no benefit.
+ * KEEPALIVE_FRAMES (480 frames ~= 10 ms at 48 kHz): the payload is a small priming block,
+ * not a whole negotiated period. So it is not "exactly one AAudio burst" when the consumer
+ * asks for a larger quantum -- do not describe it that way. Raising the cap would mean
+ * queueing proportionally more silence per cycle for no benefit.
  *
  * The result is also bounded by sizeof(a->silence) (channels are already limited by
- * valid_format()), so the process callback can never overrun the buffer.
- * Called on the loop thread; the release store is what makes the payload publication
- * visible to the realtime callback (see also detach_audio_fd_locked()). */
-static void update_silence_size(struct anland_audio *a)
+ * valid_format()), so the process callback can never overrun the buffer. */
+static size_t silence_bytes_for(uint32_t quantum, uint32_t channels)
 {
-    uint32_t frames = a->play_quantum ? a->play_quantum : KEEPALIVE_FRAMES;
+    uint32_t frames = quantum ? quantum : KEEPALIVE_FRAMES;
     if (frames > KEEPALIVE_FRAMES)
         frames = KEEPALIVE_FRAMES;
-    size_t bytes = (size_t)frames * a->play_channels * sizeof(int16_t);
-    if (bytes > sizeof(a->silence))
-        bytes = sizeof(a->silence);
-    a->silence_bytes = bytes;
+    size_t bytes = (size_t)frames * channels * sizeof(int16_t);
+    return bytes > KEEPALIVE_BYTES ? KEEPALIVE_BYTES : bytes;
+}
+
+/* Arm the keep-alive for the current attachment. Called ONLY once
+ * play_format_known is true, i.e. the consumer actually announced its playback format on
+ * this attachment, so a bare transport attach (or a stream rebuild with no consumer)
+ * leaves keepalive_len at 0 and the RT callback queueing nothing. */
+static void arm_keepalive(struct anland_audio *a)
+{
+    size_t bytes = silence_bytes_for(a->play_quantum, a->play_channels);
+    /* Publish the length first, then the epoch: the RT callback acquires the epoch and
+     * only then trusts the length it reads. */
     atomic_store_explicit(&a->keepalive_len, bytes, memory_order_release);
+    atomic_fetch_add_explicit(&a->epoch, 1, memory_order_release);
 }
 
 static void apply_format(struct anland_audio *a, const struct audio_format *f)
@@ -467,23 +671,19 @@ static void apply_format(struct anland_audio *a, const struct audio_format *f)
     uint32_t *cur_quantum  = playback ? &a->play_quantum : &a->cap_quantum;
     struct pw_stream *stream = playback ? a->capture : a->source;
 
-    /* A PLAYBACK announcement means the consumer has opened (or is about to open) its
-     * playback device: from here on the speaker stream must not be allowed to run dry, or
-     * the native stream stops and the PipeWire node stays paused forever. Re-arm the
-     * keep-alive length unconditionally -- not only on a format *change* -- because a
-     * consumer whose device already matches our defaults (48000/2, the common case)
-     * would otherwise take the early return below and never enable it at all. The
-     * function is idempotent and publishes length before any consumer of it observes a
-     * change, and its release store is what makes the payload visible to the realtime
-     * callback. */
     const bool format_changed = (rate != *cur_rate || channels != *cur_channels);
     const bool quantum_changed = (f->quantum != *cur_quantum);
 
     *cur_rate = rate;
     *cur_channels = channels;
     *cur_quantum = f->quantum;
-    if (playback)
-        update_silence_size(a);
+    if (playback) {
+        /* The consumer has told us what to play. Record the fact FIRST, then arm: a
+         * consumer whose device already matches our defaults (48000/2, the common case)
+         * would otherwise take the "unchanged" early return below and never arm at all. */
+        a->play_format_known = true;
+        arm_keepalive(a);
+    }
 
     if (!format_changed && !quantum_changed)
         return;   /* unchanged -> keep the device online, no hot-plug */
@@ -568,19 +768,19 @@ static void on_audio_readable(void *data, int fd, uint32_t mask)
 
 /* ---- PipeWire connection lifecycle (build / teardown / auto-reconnect) ---- */
 
-/* Arm the periodic tick. It doubles as the reconnect retry and as the drain point for the
- * realtime callback's edge events, so once it is armed in anland_audio_start() it is
- * always left armed (not stopped when connected) to keep those events flowing. */
-static void arm_reconnect(struct anland_audio *a)
+/* True periodic tick: pw_loop_update_timer() with a non-NULL interval re-arms itself, so
+ * this only has to be armed once (anland_audio_start) and keeps firing forever. It drives
+ * both the reconnect retry and the drain of the realtime callback's edge events. */
+static void arm_tick(struct anland_audio *a)
 {
-    struct timespec val = { .tv_sec = RECONNECT_SECS, .tv_nsec = 0 };
-    pw_loop_update_timer(pw_thread_loop_get_loop(a->loop), a->reconnect_timer,
-                         &val, NULL, false);
+    struct timespec val = { .tv_sec = TICK_SECS, .tv_nsec = 0 };
+    pw_loop_update_timer(pw_thread_loop_get_loop(a->loop), a->tick_timer,
+                         &val, &val, false);
 }
 
 /* Fatal, non-recoverable error on the core proxy means the sound service connection
- * was lost (e.g. pipewire/wireplumber restarted). Drop the dead core+streams and
- * schedule a rebuild; the audio socket / mic ring are untouched so the consumer side
+ * was lost (e.g. pipewire/wireplumber restarted). Drop the dead core+streams and let the
+ * periodic tick rebuild; the audio socket / mic ring are untouched so the consumer side
  * keeps working and resumes the moment PipeWire is back. */
 static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message)
 {
@@ -588,8 +788,7 @@ static void on_core_error(void *data, uint32_t id, int seq, int res, const char 
     (void)seq;
     (void)message;
     if (id == PW_ID_CORE && res == -EPIPE) {
-        a->pw_connected = false;
-        arm_reconnect(a);   /* teardown + rebuild happens in the timer, not here */
+        a->pw_connected = false;   /* the periodic tick notices and rebuilds */
     }
 }
 
@@ -634,9 +833,9 @@ static void set_latency(struct pw_stream *stream, uint32_t quantum, uint32_t rat
 
 /* flags are per-stream: the speaker asks for PW_STREAM_FLAG_RT_PROCESS (its callback is
  * written to be lock/alloc/log-free and must run inside the graph's own cycle), while the
- * mic must NOT use it so that its process callback stays on the PipeWire thread loop,
- * i.e. the same thread that fills the mic ring from the socket. `rt_process` selects
- * that explicitly instead of forcing RT semantics on both streams. */
+ * mic must NOT use it so that its process callback stays on the PipeWire thread loop, i.e.
+ * the same thread that fills the mic ring from the socket. `rt_process` selects that
+ * explicitly instead of forcing RT semantics on both streams. */
 static int connect_stream(struct pw_stream *stream, enum spa_direction direction,
                           uint32_t rate, uint32_t channels, uint32_t quantum,
                           bool rt_process)
@@ -655,8 +854,8 @@ static int connect_stream(struct pw_stream *stream, enum spa_direction direction
     return pw_stream_connect(stream, direction, PW_ID_ANY, flags, params, 1);
 }
 
-/* Tear down the core proxy and both streams, leaving the loop, context, timer, mic
- * ring and audio-socket io source intact. Idempotent. */
+/* Tear down the core proxy and both streams, leaving the loop, context, timers, mic ring,
+ * send queue and transport intact. Idempotent. */
 static void teardown_pw(struct anland_audio *a)
 {
     if (a->capture) {
@@ -684,16 +883,17 @@ static int build_pw(struct anland_audio *a)
         return -1;
     pw_core_add_listener(a->core, &a->core_listener, &core_events, a);
 
-    /* Re-publish the keep-alive length for the current (possibly default) format. The
-     * speaker stream is recreated here, so if this is a rebuild after the sound service
-     * went away the RT callback must be armed again from the stored format rather than
-     * waiting for the consumer to repeat its announcement. */
-    update_silence_size(a);
+    /* Re-arm the keep-alive only if the consumer is genuinely still attached AND already
+     * announced its playback format: this can be a rebuild after the sound service went
+     * away, in which case the consumer never re-announces. With no consumer, or with one
+     * that has not spoken yet, keepalive_len must stay 0. */
+    if (a->io && a->play_format_known)
+        arm_keepalive(a);
 
-    /* Own a virtual sink so the container has a real output device instead of only
-     * the auto-null "Dummy Output": apps play into this Audio/Sink, WirePlumber makes
-     * it the default (high priority beats auto_null), and on_capture_process receives
-     * the mixed PCM directly -- no monitor capture, nothing bound to the dummy.
+    /* Own a virtual sink so the container has a real output device instead of only the
+     * auto-null "Dummy Output": apps play into this Audio/Sink, WirePlumber makes it the
+     * default (high priority beats auto_null), and on_capture_process receives the mixed
+     * PCM directly -- no monitor capture, nothing bound to the dummy.
      *
      * The idle properties are what make remote playback work at all. Without them this
      * node is a follower that is only pulled while a driver is running it, so it sits
@@ -702,8 +902,7 @@ static int build_pw(struct anland_audio *a)
      * want-driver); pause-on-idle/suspend-on-idle keep it from being torn down between
      * tracks; session.suspend-timeout-seconds stops WirePlumber's session layer from
      * suspending it after a few idle seconds. Together they let the node reach
-     * streaming -- and stay there -- while on_capture_process keeps feeding the
-     * consumer. */
+     * streaming -- and stay there -- while on_capture_process keeps feeding the consumer. */
     a->capture = pw_stream_new(a->core, "anland-speaker",
         pw_properties_new(
             PW_KEY_MEDIA_TYPE, "Audio",
@@ -735,9 +934,9 @@ static int build_pw(struct anland_audio *a)
         return -1;
     pw_stream_add_listener(a->source, &a->source_listener, &source_events, a);
 
-    /* Speaker: RT process callback. Its callback is lock/alloc/log-free, and it must be
-     * fed inside the graph's own cycle or the driver can advance without the consumer
-     * ever receiving a period. */
+    /* Speaker: RT process callback. Its callback is lock/alloc/log-free and must be fed
+     * inside the graph's own cycle or the driver can advance without the consumer ever
+     * receiving a period. */
     if (connect_stream(a->capture, PW_DIRECTION_INPUT, a->play_rate, a->play_channels,
                        a->play_quantum, true) < 0)
         return -1;
@@ -751,47 +950,56 @@ static int build_pw(struct anland_audio *a)
     return 0;
 }
 
-/* Loop thread: turn the realtime callback's edge bits into log lines. Kept off the data
- * thread precisely because stdio is not realtime-safe; one pass per periodic tick is
- * plenty to observe silence/streaming transitions. */
-static void drain_rt_events(struct anland_audio *a)
+/* Loop thread: turn the realtime callback's edge bits into log lines (stdio is not
+ * realtime-safe, so it cannot be done on the data thread) and act on a stop request raised
+ * by the sender thread. One pass per tick is plenty for both. */
+static void service_rt_state(struct anland_audio *a)
 {
     uint32_t ev = atomic_exchange_explicit(&a->events, 0, memory_order_acquire);
     if (!ev)
-        return;
+        goto check_stop;
     if (ev & AUDIO_EV_KEEPALIVE_ON)
         fprintf(stderr, "anland: playback silent, keep-alive started (%zu bytes)\n",
-                a->silence_bytes);
+                atomic_load_explicit(&a->keepalive_len, memory_order_relaxed));
     if (ev & AUDIO_EV_STREAMING)
         fprintf(stderr, "anland: playback streaming (real PCM)\n");
     else if (ev & AUDIO_EV_FIRST_PCM)
         fprintf(stderr, "anland: playback streaming (first PCM captured)\n");
     if (ev & AUDIO_EV_SEND_FAIL)
         fprintf(stderr, "anland: audio sendmsg failed: %s\n",
-                strerror(atomic_load_explicit(&a->last_errno, memory_order_relaxed)));
+                strerror(atomic_load_explicit(&a->send_errno, memory_order_relaxed)));
     if (ev & AUDIO_EV_SHORT_WRITE)
         fprintf(stderr, "anland: short audio write, transport detached\n");
+    if (ev & AUDIO_EV_QUEUE_FULL)
+        fprintf(stderr, "anland: playback queue full, dropped one period\n");
+
+check_stop:
+    /* The sender thread gives up on a dead consumer by itself (it is the only thread that
+     * touches the socket) and raises this flag; the loop thread owns the teardown. */
+    if (a->io && atomic_load_explicit(&a->stop_requested, memory_order_acquire)) {
+        fprintf(stderr, "anland: audio consumer went away, detaching transport\n");
+        detach_audio_fd_locked(a);
+    }
 }
 
-/* Periodic loop-thread tick: also used as the reconnect retry when the sound service is
- * not up yet. Always armed, so the RT edge events above are always drained. */
-static void on_reconnect_timer(void *data, uint64_t expirations)
+/* Periodic loop-thread tick: drains the RT edge events and retries the PipeWire
+ * connection while the sound service is down. It re-arms itself (interval is set), so it
+ * must be armed exactly once. */
+static void on_tick(void *data, uint64_t expirations)
 {
     struct anland_audio *a = data;
     (void)expirations;
 
-    drain_rt_events(a);
+    service_rt_state(a);
 
     if (a->pw_connected)
         return;
 
     teardown_pw(a);            /* clear any half-built state from a failed attempt */
-    if (build_pw(a) == 0) {
+    if (build_pw(a) == 0)
         a->pw_connected = true;
-    } else {
-        teardown_pw(a);
-        arm_reconnect(a);      /* sound service still down -- keep retrying */
-    }
+    else
+        teardown_pw(a);        /* the periodic tick will try again */
 }
 
 /* ---- public API ---- */
@@ -819,18 +1027,30 @@ void anland_audio_set_fd(int audio_fd)
 
     if (owned_fd >= 0) {
         /* The consumer announces both device formats (AUDIO_MSG_FORMAT) right after this
-         * socket comes up; on_audio_readable applies them and reconfigures the PipeWire
-         * streams, so we don't dictate any format here. The loudspeaker keep-alive only
-         * starts once that PLAYBACK announcement has been seen. */
+         * socket comes up; on_audio_readable applies them. The keep-alive stays disarmed
+         * until that PLAYBACK announcement has been seen on this attachment, so a bare
+         * attach never queues silence for a consumer that is not listening yet. */
         a->io = pw_loop_add_io(pw_thread_loop_get_loop(a->loop), owned_fd,
                                SPA_IO_IN, true, on_audio_readable, a);
-        if (a->io) {
-            a->audio_fd = owned_fd;
-            atomic_fetch_add_explicit(&a->attach_serial, 1, memory_order_relaxed);
-            fprintf(stderr, "anland: audio transport attached\n");
-        } else {
+        if (!a->io) {
             close(owned_fd);
             fprintf(stderr, "anland: failed to register audio fd: %s\n", strerror(errno));
+        } else {
+            a->audio_fd = owned_fd;
+            /* The sender owns this duplicate for its whole lifetime and closes it, so the
+             * loop thread must NOT close it while the thread may still run. */
+            a->sock_fd = owned_fd;
+            atomic_store_explicit(&a->sender_stop, false, memory_order_relaxed);
+            if (pthread_create(&a->sender, NULL, sender_thread, a) == 0) {
+                a->sender_started = true;
+                fprintf(stderr, "anland: audio transport attached\n");
+            } else {
+                /* Without a sender there is no playback path. Hand the duplicate to the
+                 * never-started branch of the detach so it is closed exactly once, and
+                 * drop the attachment rather than pretend it works. */
+                detach_audio_fd_locked(a);
+                fprintf(stderr, "anland: failed to start audio sender thread\n");
+            }
         }
     } else {
         fprintf(stderr, "anland: audio transport detached\n");
@@ -850,16 +1070,20 @@ int anland_audio_start(void)
     if (!a)
         return -1;
     a->audio_fd = -1;
-    a->notify_read = -1;
-    a->notify_write = -1;
+    a->sock_fd = -1;
+    a->ctl_read = -1;
+    a->ctl_write = -1;
+    /* No consumer yet: keep-alive stays disarmed until a PLAYBACK format arrives. */
+    atomic_store_explicit(&a->keepalive_len, 0, memory_order_relaxed);
     a->play_rate = DEFAULT_RATE;
     a->play_channels = DEFAULT_PLAY_CHANNELS;
     a->cap_rate = DEFAULT_RATE;
     a->cap_channels = DEFAULT_CAP_CHANNELS;
-    update_silence_size(a);   /* valid fallback before any consumer announcement */
     a->ring_size = MIC_RING_BYTES;
     a->ring = malloc(a->ring_size);
     if (!a->ring)
+        goto fail;
+    if (!send_ring_init(&a->send, SEND_RING_BYTES))
         goto fail;
 
     a->loop = pw_thread_loop_new("anland-audio", NULL);
@@ -870,18 +1094,25 @@ int anland_audio_start(void)
     if (!a->context)
         goto fail;
 
-    a->reconnect_timer = pw_loop_add_timer(pw_thread_loop_get_loop(a->loop),
-                                           on_reconnect_timer, a);
-    if (!a->reconnect_timer)
+    a->tick_timer = pw_loop_add_timer(pw_thread_loop_get_loop(a->loop), on_tick, a);
+    if (!a->tick_timer)
         goto fail;
 
-    /* Wake-up pipe for a detach requested by the realtime process callback. Both ends are
-     * non-blocking CLCEXEC descriptors owned by this object; the read end is added to the
-     * loop as a normal io source, the write end is only ever poked with one byte. */
+    /* Control pipe: the sender thread sleeps on the read end and the RT callback pokes the
+     * write end to ask for a flush. Both ends are non-blocking, so a poke from the
+     * realtime thread can never block. Nothing is ever pre-written into it: the sender
+     * reads it only when it is readable, so an empty pipe simply means "nothing to flush".
+     * The pipe is read directly rather than through a loop source, so the sender thread is
+     * the only reader and no loop callback can steal its wake-ups.
+     * Teardown uses the sender's idle timeout (SEND_IDLE_MS) plus an explicit stop flag
+     * instead of piping a stop byte, which is why the pipe may be full of pokes without
+     * delaying a stop. */
     {
         int fds[2];
         if (pipe(fds) < 0)
             goto fail;
+        a->ctl_read = fds[0];
+        a->ctl_write = fds[1];
         for (int i = 0; i < 2; i++) {
             int fl = fcntl(fds[i], F_GETFL, 0);
             if (fl >= 0)
@@ -890,44 +1121,40 @@ int anland_audio_start(void)
             if (fdfl >= 0)
                 fcntl(fds[i], F_SETFD, fdfl | FD_CLOEXEC);
         }
-        a->notify_read = fds[0];
-        a->notify_write = fds[1];
     }
-    a->notify = pw_loop_add_io(pw_thread_loop_get_loop(a->loop), a->notify_read,
-                               SPA_IO_IN, false, on_notify, a);
-    if (!a->notify)
-        goto fail;
 
     if (pw_thread_loop_start(a->loop) < 0)
         goto fail;
 
-    /* First connection attempt under the loop lock. If PipeWire is not up yet, fall
-     * back to the reconnect timer instead of failing -- audio will come up when the
-     * sound service appears. Either way the engine object exists. */
+    /* First connection attempt under the loop lock. If PipeWire is not up yet, the
+     * periodic tick retries and audio comes up when the sound service appears. Either way
+     * the engine object exists. */
     pw_thread_loop_lock(a->loop);
-    if (build_pw(a) == 0) {
+    if (build_pw(a) == 0)
         a->pw_connected = true;
-        arm_reconnect(a);   /* keep the periodic tick armed to drain RT edge events */
-    } else {
+    else
         teardown_pw(a);
-        arm_reconnect(a);
-    }
+    arm_tick(a);
     pw_thread_loop_unlock(a->loop);
 
     g_audio = a;
     return 0;
 
 fail:
-    if (a->reconnect_timer)
-        pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), a->reconnect_timer);
+    if (a->loop) {
+        pw_thread_loop_stop(a->loop);
+        if (a->tick_timer)
+            pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), a->tick_timer);
+    }
     if (a->context)
         pw_context_destroy(a->context);
     if (a->loop)
         pw_thread_loop_destroy(a->loop);
-    if (a->notify_read >= 0)
-        close(a->notify_read);
-    if (a->notify_write >= 0)
-        close(a->notify_write);
+    if (a->ctl_read >= 0)
+        close(a->ctl_read);
+    if (a->ctl_write >= 0)
+        close(a->ctl_write);
+    free(a->send.buf);
     free(a->ring);
     free(a);
     pw_deinit();
@@ -942,25 +1169,34 @@ void anland_audio_stop(void)
     g_audio = NULL;
 
     /* Stop the callbacks first, then unwind in reverse creation order: streams, the
-     * transport io source (which owns audio_fd and closes it), the loop sources, and
-     * only then the context/loop. Nothing may call back into a destroyed object. */
+     * transport io source (which owns audio_fd and closes it), the sender thread (joined
+     * inside detach_audio_fd_locked, which is why it holds the lock), the loop sources,
+     * and only then the context/loop. Nothing may call back into a destroyed object. */
     if (a->loop)
         pw_thread_loop_stop(a->loop);
     teardown_pw(a);
     if (a->io)
         detach_audio_fd_locked(a);
-    if (a->reconnect_timer)
-        pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), a->reconnect_timer);
-    if (a->notify)
-        pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), a->notify);
-    if (a->notify_read >= 0)
-        close(a->notify_read);
-    if (a->notify_write >= 0)
-        close(a->notify_write);
+    else if (a->sock_fd >= 0) {
+        /* No io source (cannot normally happen): still stop and reap the sender. */
+        atomic_store_explicit(&a->sender_stop, true, memory_order_release);
+        sender_wake(a);
+        if (a->sender_started)
+            pthread_join(a->sender, NULL);
+        a->sender_started = false;
+        a->sock_fd = -1;
+    }
+    if (a->tick_timer)
+        pw_loop_destroy_source(pw_thread_loop_get_loop(a->loop), a->tick_timer);
+    if (a->ctl_read >= 0)
+        close(a->ctl_read);
+    if (a->ctl_write >= 0)
+        close(a->ctl_write);
     if (a->context)
         pw_context_destroy(a->context);
     if (a->loop)
         pw_thread_loop_destroy(a->loop);
+    free(a->send.buf);
     free(a->ring);
     free(a);
     pw_deinit();
