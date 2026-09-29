@@ -4,3 +4,5 @@ revision 1   89e6cebff4b39487a7df596e5705a9f35e59dc75
              backend/anland: make the RT process callback actually realtime-safe
 revision 2   4d17eff997a0ddf9ab323eeb984de390a3fbf0e7
              backend/anland: take the audio socket out of the realtime callback
+revision 3   cab5b98fe04117dcfe834f761f164b49e91dbc2b
+             backend/anland: fix playback queue framing, ownership and gating
