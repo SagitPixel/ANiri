@@ -14,6 +14,15 @@
 
 ---
 
+> ## ⚠️ 本报告描述的是 `ec9ef2f`，已被 `89e6ceb` 修订
+>
+> `ec9ef2f` 中关于「RT callback 完全 realtime-safe」的说法**不准确**，且
+> `PW_STREAM_FLAG_RT_PROCESS` 被加到了 speaker 和 mic **两个** stream 上。
+> `89e6ceb` 修正了这两点。阅读 §4.3、§4.4、§4.6、§8 时请以
+> [RT_SAFETY_REVISION.md](RT_SAFETY_REVISION.md) 为准。
+>
+> 本文件作为**历史档案**保留，不逐处改写，以免掩盖当时的分析过程。
+
 ## 0. 验证状态总览（先读这一节）
 
 本报告严格区分「已在本机完成」与「必须部署到目标 ARM64 DroidSpaces 设备后验证」。
