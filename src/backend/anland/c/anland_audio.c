@@ -82,11 +82,19 @@
  * the consumer loads head with acquire before reading that data (and vice versa for
  * tail). No lock, no allocation, and no file descriptor is shared with the RT thread. */
 
-/* First header field of every queued slot: the AUDIO_MSG_PCM header, so a slot can be
- * handed to sendmsg by pointing straight at the queue. */
+/* One queue slot = local bookkeeping + the exact wire message.
+ *
+ *   [ slot.len ][ slot.epoch ][ slot.msg ][ PCM payload ]
+ *   \____________ local only ________/\____ goes on the wire ____/
+ *
+ * x.len and x.epoch are ring-internal: they exist so the consumer can find the next slot
+ * and drop slots that belong to an older attachment. Only x.msg + payload are ever handed
+ * to sendmsg -- see send_ring_peek(), which reports the wire span, not the slot span. */
 struct send_slot {
-    uint32_t       len;    /* total bytes of this slot including this field */
+    uint32_t         len;    /* total bytes of this slot, including this field */
+    uint32_t         epoch;  /* attachment generation this slot belongs to */
     struct audio_msg msg;
+    /* payload follows */
 };
 
 struct send_ring {
@@ -140,6 +148,10 @@ struct anland_audio {
      * callback. 0 means "no playback consumer attached / no PLAYBACK format yet", which
      * is also the gate that stops the RT callback from enqueueing anything. */
     _Atomic size_t         keepalive_len;
+    /* True only between "this attachment announced AUDIO_ROLE_PLAYBACK" and detach. It
+     * gates the REAL PCM path too, so detach cannot leave PCM queued for a consumer that
+     * is gone and a fresh consumer cannot receive it before it asked for playback. */
+    _Atomic bool           playback_ready;
     /* Attachment generation. Bumped (release) on every attach, detach and accepted
      * PLAYBACK format, after the corresponding keepalive_len store. The RT callback
      * caches it and resets its private state whenever it changes, so a detach/reconnect
@@ -203,29 +215,35 @@ static size_t send_ring_used(const struct send_ring *r)
                     atomic_load_explicit(&r->tail, memory_order_relaxed));
 }
 
-/* Producer. Copies one whole message plus its 4-byte length prefix, or reports failure so
- * the caller can count a drop. Never splits a message and never blocks. */
-static bool send_ring_push(struct send_ring *r, const struct audio_msg *hdr,
+/* Producer. Copies one whole message plus its local slot header, or reports failure so the
+ * caller can count a drop. Never splits a message and never blocks. `epoch` is the
+ * attachment generation the caller observed for this period. */
+static bool send_ring_push(struct send_ring *r, uint32_t epoch,
+                           const struct audio_msg *hdr,
                            const uint8_t *payload, size_t payload_len)
 {
-    size_t total = sizeof(uint32_t) + sizeof(*hdr) + payload_len;
+    uint8_t header[sizeof(struct send_slot)];
+    struct send_slot *slot = (struct send_slot *)header;
+    size_t total = sizeof(*slot) + payload_len;
     uint64_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
 
     if (total > r->size || (size_t)(head - tail) + total > r->size)
         return false;
 
-    uint32_t len = (uint32_t)total;
+    slot->len = (uint32_t)total;
+    slot->epoch = epoch;
+    slot->msg = *hdr;
+
     uint8_t *dst = r->buf;
     size_t start = (size_t)(head & (r->size - 1));
 
-    struct iovec src[3] = {
-        { .iov_base = &len, .iov_len = sizeof(len) },
-        { .iov_base = (void *)hdr, .iov_len = sizeof(*hdr) },
+    struct iovec src[2] = {
+        { .iov_base = header, .iov_len = sizeof(*slot) },
         { .iov_base = (void *)payload, .iov_len = payload_len },
     };
     size_t off = start;
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < 2; i++) {
         const uint8_t *p = src[i].iov_base;
         size_t n = src[i].iov_len;
         if (n > r->size - off) {
@@ -242,11 +260,15 @@ static bool send_ring_push(struct send_ring *r, const struct audio_msg *hdr,
     return true;
 }
 
-/* Consumer: locate the next whole slot. Returns false when the queue is empty (or holds a
- * slot that is still being published), otherwise *off is the absolute byte offset of the
- * slot start and *len its total length. The slot may wrap the end of the buffer, so the
- * caller works from the offset, not from a pointer. Valid until send_ring_consume(). */
-static bool send_ring_peek(struct send_ring *r, size_t *off, size_t *len)
+/* Consumer: locate the next whole slot.
+ *
+ * On success, slot_len is the full slot length (what send_ring_consume() must be given),
+ * wire_off and wire_len describe the message to put on the wire -- i.e. the slot minus its
+ * local header -- and epoch is the attachment the slot belongs to. The wire span may wrap
+ * the end of the buffer, so the caller works from the offset rather than a pointer.
+ * Returns false when the queue is empty or holds a slot that is still being published. */
+static bool send_ring_peek(struct send_ring *r, size_t *slot_len, size_t *wire_off,
+                           size_t *wire_len, uint32_t *epoch)
 {
     uint64_t head = atomic_load_explicit(&r->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
@@ -254,24 +276,27 @@ static bool send_ring_peek(struct send_ring *r, size_t *off, size_t *len)
     if (head == tail)
         return false;
     if ((size_t)(head - tail) < sizeof(struct send_slot))
-        return false;   /* the length prefix is not fully published yet */
+        return false;   /* the local header is not fully published yet */
 
     size_t start = (size_t)(tail & (r->size - 1));
-    uint32_t len32;
-    if (sizeof(len32) > r->size - start) {
-        /* The length prefix itself straddles the wrap. */
-        size_t first = r->size - start;
-        memcpy(&len32, r->buf + start, first);
-        memcpy((uint8_t *)&len32 + first, r->buf, sizeof(len32) - first);
-    } else {
-        memcpy(&len32, r->buf + start, sizeof(len32));
-    }
+    uint8_t header[sizeof(struct send_slot)];
+    size_t first = r->size - start;
+    if (first > sizeof(header))
+        first = sizeof(header);
+    memcpy(header, r->buf + start, first);
+    if (first < sizeof(header))
+        memcpy(header + first, r->buf, sizeof(header) - first);
 
-    if (len32 < sizeof(struct send_slot) || (size_t)(head - tail) < len32)
+    struct send_slot slot;
+    memcpy(&slot, header, sizeof(slot));
+
+    if (slot.len < sizeof(slot) || (size_t)(head - tail) < slot.len)
         return false;   /* not a whole slot yet: retry on the next pass */
 
-    *off = start;
-    *len = len32;
+    *slot_len = slot.len;
+    *wire_off = (start + sizeof(slot)) & (r->size - 1);
+    *wire_len = slot.len - sizeof(slot);
+    *epoch = slot.epoch;
     return true;
 }
 
@@ -334,26 +359,44 @@ static void sender_wake(struct anland_audio *a)
     (void)n;
 }
 
-/* Send one queued message. Returns 0 when the slot was fully sent (and consumed),
- * -EAGAIN when the kernel had no room (slot kept for a later pass), -EPIPE when the
- * consumer is gone and the attachment should be dropped. */
-static int sender_send_one(struct anland_audio *a, int fd)
-{
-    size_t off = 0, len = 0;
-    if (!send_ring_peek(&a->send, &off, &len))
-        return 0;
+/* Outcome of one attempt to hand the next queued slot to the socket. */
+enum send_result {
+    SEND_EMPTY = 0,   /* nothing to do: no slot (or only a stale one) is queued */
+    SEND_SENT,        /* one whole wire message was sent and the slot consumed */
+    SEND_AGAIN,       /* kernel buffer full: the slot was kept for a later pass */
+    SEND_DEAD,        /* consumer gone or framing broken: drop the attachment */
+};
 
-    /* One slot is one whole AUDIO_MSG_PCM message. It is a single contiguous run unless it
-     * wrapped the end of the queue, in which case two iovecs describe it and sendmsg()
-     * still puts exactly one message on the socket -- SEQPACKET framing is preserved. */
+/* Send the next queued message. Slots are one whole AUDIO_MSG_PCM each; only the wire part
+ * of the slot is transmitted, never the ring's local header.
+ *
+ * Slots carry the attachment generation they were produced for. Anything from an older
+ * attachment is discarded here rather than sent, which is what makes detach/reconnect (and
+ * a PLAYBACK format change) unable to leak stale PCM into a new consumer's stream. */
+static enum send_result sender_send_one(struct anland_audio *a, int fd)
+{
+    size_t slot_len = 0, wire_off = 0, wire_len = 0;
+    uint32_t epoch = 0;
+
+    if (!send_ring_peek(&a->send, &slot_len, &wire_off, &wire_len, &epoch))
+        return SEND_EMPTY;
+
+    if (epoch != atomic_load_explicit(&a->epoch, memory_order_acquire)) {
+        send_ring_consume(&a->send, slot_len);
+        return SEND_EMPTY;   /* stale slot dropped; caller re-checks the queue */
+    }
+
+    /* The wire message is one contiguous run unless it wrapped the end of the queue, in
+     * which case two iovecs describe it and sendmsg() still puts exactly one message on
+     * the socket -- SEQPACKET framing is preserved. */
     struct iovec iov[2];
     size_t n_iov = 1;
-    iov[0].iov_base = a->send.buf + off;
-    iov[0].iov_len = len;
-    if (off + len > a->send.size) {
-        iov[0].iov_len = a->send.size - off;
+    iov[0].iov_base = a->send.buf + wire_off;
+    iov[0].iov_len = wire_len;
+    if (wire_off + wire_len > a->send.size) {
+        iov[0].iov_len = a->send.size - wire_off;
         iov[1].iov_base = a->send.buf;
-        iov[1].iov_len = len - iov[0].iov_len;
+        iov[1].iov_len = wire_len - iov[0].iov_len;
         n_iov = 2;
     }
     struct msghdr m = { .msg_iov = iov, .msg_iovlen = n_iov };
@@ -361,26 +404,27 @@ static int sender_send_one(struct anland_audio *a, int fd)
     ssize_t n = sendmsg(fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-            return -EAGAIN;   /* keep the slot, let the queue push back */
+            return SEND_AGAIN;   /* keep the slot, let the queue push back */
         if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
-            return -EPIPE;
+            return SEND_DEAD;
         atomic_store_explicit(&a->send_errno, errno, memory_order_relaxed);
         atomic_fetch_or_explicit(&a->events, AUDIO_EV_SEND_FAIL, memory_order_release);
-        return -EPIPE;   /* unknown failure: drop the attachment, do not spin on it */
+        return SEND_DEAD;   /* unknown failure: drop the attachment, do not spin on it */
     }
-    if (n != (ssize_t)len) {
+    if (n != (ssize_t)wire_len) {
         /* One whole message per AUDIO_MSG_PCM on a message socket: a short write means the
          * framing can no longer be trusted. */
         atomic_fetch_or_explicit(&a->events, AUDIO_EV_SHORT_WRITE, memory_order_release);
-        return -EPIPE;
+        return SEND_DEAD;
     }
-    send_ring_consume(&a->send, len);
-    return 0;
+
+    send_ring_consume(&a->send, slot_len);   /* the slot, not the wire span */
+    return SEND_SENT;
 }
 
 /* Owns the transport fd for its whole lifetime. Exits only after the loop thread has
  * signalled a stop, so the loop thread can close/discard the fd immediately after the
- * join without any window in which this thread (or the RT callback) could still use it. */
+ * join without any window in which this thread could still use it. */
 static void *sender_thread(void *data)
 {
     struct anland_audio *a = data;
@@ -388,25 +432,31 @@ static void *sender_thread(void *data)
     uint8_t drain[64];
 
     while (!atomic_load_explicit(&a->sender_stop, memory_order_acquire)) {
-        int res = 0;
-        while (!atomic_load_explicit(&a->sender_stop, memory_order_acquire) &&
-               (res = sender_send_one(a, fd)) == 0)
-            ;   /* drain the queue */
+        enum send_result res = sender_send_one(a, fd);
 
-        if (res == -EPIPE) {
-            atomic_store_explicit(&a->stop_requested, true, memory_order_release);
-            sender_wake(a);   /* ask the loop thread to finish the detach */
-            break;
-        }
-        if (res == -EAGAIN) {
+        switch (res) {
+        case SEND_SENT:
+            continue;   /* more may be queued */
+
+        case SEND_AGAIN: {
             /* Kernel send buffer full: wait for writability, still bounded so a stop
-             * request is never missed for long. */
+             * request is never missed for long. The slot is kept, not dropped. */
             struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
             poll(&pfd, 1, SEND_IDLE_MS);
             continue;
         }
 
-        /* Queue empty: sleep until woken, or until the idle timeout re-checks stop. */
+        case SEND_DEAD:
+            atomic_store_explicit(&a->stop_requested, true, memory_order_release);
+            sender_wake(a);   /* ask the loop thread to finish the detach */
+            return NULL;
+
+        case SEND_EMPTY:
+        default:
+            break;
+        }
+
+        /* Nothing to send: sleep until woken, or until the idle timeout re-checks stop. */
         struct pollfd pfd = { .fd = a->ctl_read, .events = POLLIN, .revents = 0 };
         if (poll(&pfd, 1, SEND_IDLE_MS) > 0 && (pfd.revents & POLLIN)) {
             ssize_t n = read(a->ctl_read, drain, sizeof(drain));
@@ -414,9 +464,9 @@ static void *sender_thread(void *data)
         }
     }
 
-    /* Last flush so a stop request does not silence an already queued period. */
-    while (sender_send_one(a, fd) == 0)
-        ;
+    /* No flush on the way out: a detach is not a place to deliver one last period of audio
+     * to a consumer that is going away, and waiting for the kernel here would only extend
+     * the join. Whatever is still queued is dropped by the detach path. */
     close(fd);
     return NULL;
 }
@@ -431,10 +481,12 @@ static void detach_audio_fd_locked(struct anland_audio *a)
     a->io = NULL;
     a->audio_fd = -1;
 
-    /* Disarm the keep-alive BEFORE the sender is torn down, so the RT callback cannot
-     * enqueue a fresh period for a consumer we are about to forget. The epoch bump makes
-     * the RT callback reset its private state even if it never observed the 0. */
+    /* Disarm BOTH playback paths BEFORE the sender is torn down, so the RT callback cannot
+     * enqueue a fresh period (real or silence) for a consumer we are about to forget. The
+     * epoch bump also makes the RT callback reset its private state, discard is handled by
+     * the sender comparing slot epochs, and the queue is emptied below. */
     atomic_store_explicit(&a->keepalive_len, 0, memory_order_release);
+    atomic_store_explicit(&a->playback_ready, false, memory_order_release);
     atomic_fetch_add_explicit(&a->epoch, 1, memory_order_release);
     a->play_format_known = false;
 
@@ -449,9 +501,13 @@ static void detach_audio_fd_locked(struct anland_audio *a)
     a->sock_fd = -1;
     atomic_store_explicit(&a->stop_requested, false, memory_order_relaxed);
 
-    /* Drain anything the sender left behind (queue is empty after the join; this also
-     * clears the case where the sender never started). */
-    send_ring_consume(&a->send, send_ring_used(&a->send));
+    /* Drop whatever is still queued. The sender no longer flushes on the way out (a
+     * detach must not push one last period at a consumer that is leaving), and the RT
+     * callback is already disarmed above, so nothing can be added after this point. The
+     * producer is the only writer of `head` and it is quiescent, so resetting both indices
+     * here is safe and gives the next attachment a completely empty queue. */
+    atomic_store_explicit(&a->send.head, 0, memory_order_release);
+    atomic_store_explicit(&a->send.tail, 0, memory_order_release);
 
     ring_reset(a);
     if (io)
@@ -508,10 +564,23 @@ static void on_capture_process(void *data)
         a->rt_keepalive_on = false;
     }
 
+    /* One epoch read decides everything for this period: whether playback is armed at all
+     * and which attachment the queued slot belongs to. Reading it before the payload is
+     * chosen means a detach that lands mid-period produces a slot tagged with the epoch the
+     * sender will have moved past, and the sender drops it instead of sending it. */
+    const uint32_t slot_epoch = epoch;
+    const bool ready = atomic_load_explicit(&a->playback_ready, memory_order_acquire);
+
     const uint8_t *payload = NULL;
     size_t size = 0;
 
     if (d->data && d->chunk->size > 0) {
+        if (!ready) {
+            /* No consumer has asked for playback on this attachment yet. Pass-through
+             * without a destination is the pre-fix bug: drop the period instead. */
+            pw_stream_queue_buffer(a->capture, b);
+            return;
+        }
         /* Real PCM (or upstream silence) at the graph's current period. Queueing exactly
          * what was dequeued keeps byte counts identical to the plain pass-through path,
          * so no fixed-size silence is ever spliced into a live stream -- no added
@@ -531,7 +600,7 @@ static void on_capture_process(void *data)
          * attached AND has announced its PLAYBACK format, which is exactly the gate that
          * keeps us from queueing silence for nobody. The payload lives in this object and
          * is never written here, so the pointer stays valid; the length is atomic. */
-        size = atomic_load_explicit(&a->keepalive_len, memory_order_acquire);
+        size = ready ? atomic_load_explicit(&a->keepalive_len, memory_order_acquire) : 0;
         if (size > 0 && size <= sizeof(a->silence)) {
             payload = a->silence;
             if (!a->rt_keepalive_on) {
@@ -546,7 +615,7 @@ static void on_capture_process(void *data)
 
     if (payload) {
         struct audio_msg h = { .type = AUDIO_MSG_PCM, .size = (uint32_t)size };
-        if (!send_ring_push(&a->send, &h, payload, size))
+        if (!send_ring_push(&a->send, slot_epoch, &h, payload, size))
             atomic_fetch_or_explicit(&a->events, AUDIO_EV_QUEUE_FULL, memory_order_release);
         else
             sender_wake(a);
@@ -653,9 +722,10 @@ static size_t silence_bytes_for(uint32_t quantum, uint32_t channels)
 static void arm_keepalive(struct anland_audio *a)
 {
     size_t bytes = silence_bytes_for(a->play_quantum, a->play_channels);
-    /* Publish the length first, then the epoch: the RT callback acquires the epoch and
-     * only then trusts the length it reads. */
+    /* Publish the length and the readiness flag first, then the epoch: the RT callback
+     * acquires the epoch and only then trusts the values it reads. */
     atomic_store_explicit(&a->keepalive_len, bytes, memory_order_release);
+    atomic_store_explicit(&a->playback_ready, true, memory_order_release);
     atomic_fetch_add_explicit(&a->epoch, 1, memory_order_release);
 }
 
@@ -1010,13 +1080,23 @@ void anland_audio_set_fd(int audio_fd)
     if (!a)
         return;
 
-    /* Duplicate BEFORE touching engine state: display_producer retains the original fd,
-     * so a failure here must not cost us a working attachment. */
-    int owned_fd = -1;
+    /* Two INDEPENDENT duplicates, one owner each. display_producer retains the original
+     * fd, so neither user may take it directly, and sharing a single duplicate between the
+     * io source and the sender thread would mean two owners closing the same number.
+     * Duplicating before touching engine state also means a failure here cannot cost us an
+     * attachment that is already working. */
+    int io_fd = -1, sender_fd = -1;
     if (audio_fd >= 0) {
-        owned_fd = fcntl(audio_fd, F_DUPFD_CLOEXEC, 3);
-        if (owned_fd < 0) {
+        io_fd = fcntl(audio_fd, F_DUPFD_CLOEXEC, 3);
+        if (io_fd < 0) {
             fprintf(stderr, "anland: failed to duplicate audio fd: %s\n", strerror(errno));
+            return;
+        }
+        sender_fd = fcntl(audio_fd, F_DUPFD_CLOEXEC, 3);
+        if (sender_fd < 0) {
+            fprintf(stderr, "anland: failed to duplicate audio fd for sender: %s\n",
+                    strerror(errno));
+            close(io_fd);
             return;
         }
     }
@@ -1025,33 +1105,37 @@ void anland_audio_set_fd(int audio_fd)
 
     detach_audio_fd_locked(a);
 
-    if (owned_fd >= 0) {
-        /* The consumer announces both device formats (AUDIO_MSG_FORMAT) right after this
-         * socket comes up; on_audio_readable applies them. The keep-alive stays disarmed
-         * until that PLAYBACK announcement has been seen on this attachment, so a bare
-         * attach never queues silence for a consumer that is not listening yet. */
-        a->io = pw_loop_add_io(pw_thread_loop_get_loop(a->loop), owned_fd,
+    if (io_fd >= 0) {
+        /* io_fd is now owned by the io source: pw_loop_add_io(..., close=true) closes it
+         * when the source is destroyed, and nothing else may close it. */
+        a->io = pw_loop_add_io(pw_thread_loop_get_loop(a->loop), io_fd,
                                SPA_IO_IN, true, on_audio_readable, a);
         if (!a->io) {
-            close(owned_fd);
+            close(io_fd);       /* registration failed, so nobody owns it yet */
+            close(sender_fd);
             fprintf(stderr, "anland: failed to register audio fd: %s\n", strerror(errno));
         } else {
-            a->audio_fd = owned_fd;
-            /* The sender owns this duplicate for its whole lifetime and closes it, so the
-             * loop thread must NOT close it while the thread may still run. */
-            a->sock_fd = owned_fd;
+            a->audio_fd = io_fd;
+            /* sender_fd is owned by the sender thread for its whole lifetime, which closes
+             * it; the loop thread only closes it if the thread never started. Publish it
+             * before pthread_create() so the new thread always sees its own descriptor. */
+            a->sock_fd = sender_fd;
             atomic_store_explicit(&a->sender_stop, false, memory_order_relaxed);
-            if (pthread_create(&a->sender, NULL, sender_thread, a) == 0) {
-                a->sender_started = true;
-                fprintf(stderr, "anland: audio transport attached\n");
-            } else {
-                /* Without a sender there is no playback path. Hand the duplicate to the
-                 * never-started branch of the detach so it is closed exactly once, and
-                 * drop the attachment rather than pretend it works. */
+            if (pthread_create(&a->sender, NULL, sender_thread, a)) {
+                a->sock_fd = -1;
+                close(sender_fd);
                 detach_audio_fd_locked(a);
                 fprintf(stderr, "anland: failed to start audio sender thread\n");
+            } else {
+                a->sender_started = true;
+                fprintf(stderr, "anland: audio transport attached\n");
             }
         }
+        /* The consumer announces both device formats (AUDIO_MSG_FORMAT) right after this
+         * socket comes up; on_audio_readable applies them. Neither the real PCM path nor
+         * the keep-alive is armed until that PLAYBACK announcement has been seen on this
+         * attachment, so a bare attach can never leak audio to a consumer that has not
+         * declared what it wants to play. */
     } else {
         fprintf(stderr, "anland: audio transport detached\n");
     }
@@ -1073,8 +1157,10 @@ int anland_audio_start(void)
     a->sock_fd = -1;
     a->ctl_read = -1;
     a->ctl_write = -1;
-    /* No consumer yet: keep-alive stays disarmed until a PLAYBACK format arrives. */
+    /* No consumer yet: both playback paths stay disarmed until a PLAYBACK format is
+     * announced on an attachment. */
     atomic_store_explicit(&a->keepalive_len, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->playback_ready, false, memory_order_relaxed);
     a->play_rate = DEFAULT_RATE;
     a->play_channels = DEFAULT_PLAY_CHANNELS;
     a->cap_rate = DEFAULT_RATE;
