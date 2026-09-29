@@ -8,3 +8,5 @@ revision 3   cab5b98fe04117dcfe834f761f164b49e91dbc2b
              backend/anland: fix playback queue framing, ownership and gating
 revision 4   bcc887ee8d9289463fa854a7d1c1d64fcd8363d3
              backend/anland: keep the send queue head producer-owned and tidy the sender
+revision 5   f337d2d679d0698137029bf2d7d940de38f07e4e
+             backend/anland: bound the wire span by the local header, not the whole slot
