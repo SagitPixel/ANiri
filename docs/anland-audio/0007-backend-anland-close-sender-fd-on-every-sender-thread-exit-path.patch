@@ -1,0 +1,104 @@
+From f9a4af046688b576bdce448218dd2e7ecbe6b7d6 Mon Sep 17 00:00:00 2001
+From: ANiri anland audio fix <anland-audio@localhost>
+Date: Wed, 30 Sep 2026 01:09:19 +0800
+Subject: [PATCH] backend/anland: close sender_fd on every sender-thread exit
+ path
+
+sender_thread() returned directly from the SEND_DEAD case:
+
+    case SEND_DEAD:
+        atomic_store_explicit(&a->stop_requested, true, memory_order_release);
+        return NULL;
+
+which skipped the trailing close(fd). Every SEND_DEAD outcome therefore leaked
+sender_fd: EPIPE / ECONNRESET / ENOTCONN from sendmsg, a short write, and the
+unknown-error branch. detach_audio_fd_locked() does not compensate -- with
+sender_started set it only pthread_join()s and then sets sock_fd = -1, and the
+loop thread's own close(sender_fd) is reserved for the case where
+pthread_create() failed, so the descriptor was genuinely lost.
+
+The function now has a single exit:
+
+    case SEND_DEAD:
+        atomic_store_explicit(&a->stop_requested, true, memory_order_release);
+        goto out;
+    ...
+out:
+    close(fd);
+    return NULL;
+
+so sender_fd is closed exactly once on every path this thread can take. The
+ownership split is unchanged and now holds without exception: io_fd belongs to
+the PipeWire io source, sender_fd belongs to the sender thread, and the loop
+thread only closes sender_fd when the thread never started.
+
+Also removed send_ring_used(), which has had no callers since the sender stopped
+using it to clear the queue on detach (the detach path now moves tail up to head
+directly). Verified with real code generation rather than -fsyntax-only, which
+never reports -Wunused-function: the warning fires on f337d2d and is gone here.
+
+No other change. wire framing, the sender architecture, playback_ready, the slot
+epoch, the keep-alive and the mic threading are all untouched, and the
+format-change window is still only described in the docs.
+---
+ src/backend/anland/c/anland_audio.c | 27 ++++++++++++++-------------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/src/backend/anland/c/anland_audio.c b/src/backend/anland/c/anland_audio.c
+index 4920ec8..668c21f 100644
+--- a/src/backend/anland/c/anland_audio.c
++++ b/src/backend/anland/c/anland_audio.c
+@@ -227,12 +227,6 @@ static bool send_ring_init(struct send_ring *r, size_t size)
+     return true;
+ }
+ 
+-static size_t send_ring_used(const struct send_ring *r)
+-{
+-    return (size_t)(atomic_load_explicit(&r->head, memory_order_acquire) -
+-                    atomic_load_explicit(&r->tail, memory_order_relaxed));
+-}
+-
+ /* Producer. Copies one whole message plus its local slot header, or reports failure so the
+  * caller can count a drop. Never splits a message and never blocks. `epoch` is the
+  * attachment generation the caller observed for this period. */
+@@ -483,13 +477,13 @@ static void *sender_thread(void *data)
+         }
+ 
+         case SEND_DEAD:
+-            /* Raise the flag for the loop thread and return. Do NOT call sender_wake()
+-             * here: that pipe is read by this very thread, so it cannot wake the loop.
+-             * The loop thread picks stop_requested up on its 1 s periodic tick
+-             * (service_rt_state) and performs the detach. The sender is already gone by
++            /* Raise the flag for the loop thread and leave through the common exit. Do NOT
++             * call sender_wake() here: that pipe is read by this very thread, so it cannot
++             * wake the loop -- the loop thread picks stop_requested up on its 1 s periodic
++             * tick (service_rt_state) and performs the detach. The sender is already gone by
+              * then, which detach_audio_fd_locked() handles through sender_started. */
+             atomic_store_explicit(&a->stop_requested, true, memory_order_release);
+-            return NULL;
++            goto out;
+ 
+         case SEND_EMPTY:
+         default:
+@@ -504,9 +498,16 @@ static void *sender_thread(void *data)
+         }
+     }
+ 
+-    /* No flush on the way out: a detach is not a place to deliver one last period of audio
++out:
++    /* The single exit path for every way this thread can end -- normal stop or SEND_DEAD.
++     * No flush on the way out: a detach is not a place to deliver one last period of audio
+      * to a consumer that is going away, and waiting for the kernel here would only extend
+-     * the join. Whatever is still queued is dropped by the detach path. */
++     * the join. Whatever is still queued is dropped by the detach path.
++     *
++     * This is the ONLY place sender_fd is closed on the running-thread path, which is what
++     * makes "exactly one close" hold: detach_audio_fd_locked() only pthread_join()s when
++     * sender_started is set, and the loop thread's own close(sender_fd) is reserved for the
++     * pthread_create() failure case where this thread never came into existence. */
+     close(fd);
+     return NULL;
+ }
+-- 
+2.43.0
+

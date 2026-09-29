@@ -10,3 +10,5 @@ revision 4   bcc887ee8d9289463fa854a7d1c1d64fcd8363d3
              backend/anland: keep the send queue head producer-owned and tidy the sender
 revision 5   f337d2d679d0698137029bf2d7d940de38f07e4e
              backend/anland: bound the wire span by the local header, not the whole slot
+revision 6   f9a4af046688b576bdce448218dd2e7ecbe6b7d6
+             backend/anland: close sender_fd on every sender-thread exit path
