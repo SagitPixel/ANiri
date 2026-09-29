@@ -1,0 +1,3 @@
+ec9ef2f
+commit ec9ef2fbee48b62c97a6b1d12b1aadbc10d912cb
+subject backend/anland: keep PipeWire speaker stream alive
