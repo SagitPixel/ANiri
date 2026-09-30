@@ -173,8 +173,9 @@ gcc -c -O2 -Wall -Wextra -Wunused-function -Wunused-variable \
 | `send_ring_used` 残留 | `grep` | ✅ 已删除 |
 | framing 不变式 | 提取生产函数的 harness（400 轮跨环 + stale-epoch + 空/超额/灌满） | ✅ **FRAMING INVARIANTS STILL PASS** |
 
-未完成的验证（不变）：❌ `cargo build`（本机无 Rust 工具链，MSRV 1.87）、
-❌ aarch64 交叉编译；🔴 Android 真机出声 / `pw-top` 进入 `R` / consumer 重连 / KGSL。
+未完成的验证（不变）：⚪ `cargo build`（本机无 Rust 工具链，MSRV 1.87）、
+⚪ aarch64 交叉编译（ARM64 release 构建已在目标设备完成）；✅ Android 真机出声 /
+`pw-top` 进入 `R` / KGSL **已真机验证通过**；🟡 consumer 重连未做完整稳定性验证。
 
 ---
 
@@ -224,3 +225,10 @@ ls -l /proc/$PID/fd | grep -c socket
 ```bash
 journalctl -u niri-anland.service -o cat | grep '^anland:'
 ```
+
+> **真机验证状态更新（后续）**：上述「未完成的验证」是本次修订**当时**的快照。
+> speaker / playback 主链路已在目标 ARM64 DroidSpaces 设备验证通过（ARM64 release 构建、
+> 新 binary 运行、节点创建、`pw-play` 进入 `streaming`、`pw-top` `R`/`RATE`/`QUANT` 非 0、
+> Android 扬声器实际出声）。**Firefox 播放与 mic capture 仍未完成**，
+> disconnect/reconnect 未做稳定性验证。当前状态以
+> [README.md](README.md)「真机验证状态」一节为准。

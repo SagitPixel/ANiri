@@ -11,6 +11,7 @@
 | Commit message | `backend/anland: keep PipeWire speaker stream alive` |
 | 改动规模 | 2 文件，+284 / −36 |
 | 完整补丁存档 | [`0001-backend-anland-keep-PipeWire-speaker-stream-alive.patch`](0001-backend-anland-keep-PipeWire-speaker-stream-alive.patch) |
+| 真机验证 | ✅ speaker / playback 主链路已在目标 ARM64 DroidSpaces 设备验证通过（见 §0、§7、附录 B）；Firefox 与 mic capture 仍未完成 |
 
 ---
 
@@ -21,11 +22,13 @@
 > `89e6ceb` 修正了这两点。阅读 §4.3、§4.4、§4.6、§8 时请以
 > [RT_SAFETY_REVISION.md](RT_SAFETY_REVISION.md) 为准。
 >
-> 本文件作为**历史档案**保留，不逐处改写，以免掩盖当时的分析过程。
+> 本文件的分析章节（§1–§6、§8、§10）作为**历史档案**保留，不逐处改写，以免掩盖当时的
+> 分析过程；但 **§0、§7、附录 B 的验证状态已按 ARM64 DroidSpaces 真机测试结果更新**。
 
 ## 0. 验证状态总览（先读这一节）
 
-本报告严格区分「已在本机完成」与「必须部署到目标 ARM64 DroidSpaces 设备后验证」。
+本报告严格区分「当时在 x86_64 开发机完成」与「已在目标 ARM64 DroidSpaces 设备验证」。
+**状态已在真机测试后更新**；未逐条改写的历史分析见各修订文档。
 
 | # | 工作项 | 状态 |
 |---|---|---|
@@ -38,15 +41,26 @@
 | 7 | C 静态检查（严格告警 + `cc` crate 等价编译参数） | ✅ 已完成，0 warning |
 | 8 | 与 PipeWire 头文件 API 兼容性核对（1.0.5 / 1.6.9） | ✅ 已完成 |
 | 9 | 本机沙箱内复现 `connecting -> paused` 故障 | ✅ 已复现 |
-| 10 | 完整 `cargo build`（x86_64 debug/release） | ❌ **未做**：本机无 Rust 工具链（项目 MSRV 1.87，系统仅 1.75），且缺 libinput/libwayland/libdisplay-info 等 sys 库；未改动任何 Rust 代码 |
-| 11 | aarch64 交叉编译 | ❌ **未做**：本机无 aarch64 工具链与 sysroot |
-| 12 | Android 真机扬声器出声 | 🔴 **需部署验证** |
-| 13 | `pw-play` / Firefox 真机声音 | 🔴 **需部署验证** |
-| 14 | `pw-top` 进入 `R` 且 `QUANT/RATE` 非 0 | 🔴 **需部署验证** |
-| 15 | Anland consumer 真机 disconnect / reconnect | 🔴 **需部署验证** |
-| 16 | KGSL / ARM64 runtime 真机验证 | 🔴 **需部署验证** |
+| 10 | 完整 `cargo build`（x86_64 debug/release） | ⚪ **本机未做**：开发机无 Rust 工具链（项目 MSRV 1.87，系统仅 1.75），且缺 libinput/libwayland/libdisplay-info 等 sys 库；未改动任何 Rust 代码 |
+| 11 | ARM64 release 构建（目标 DroidSpaces 设备） | ✅ **已完成**：已在目标设备成功编译 ARM64 release binary |
+| 12 | 新 ANiri binary 实际运行 | ✅ **已完成** |
+| 13 | `anland-speaker` / `anland-mic` 节点创建 | ✅ **已完成** |
+| 14 | `pw-play` 真机播放 | ✅ **已完成**（进入 streaming，实际出声） |
+| 15 | `pw-top` 进入 `R` 且 `QUANT/RATE` 非 0 | ✅ **已验证** |
+| 16 | Android 扬声器实际出声（48 kHz / stereo） | ✅ **已验证** |
+| 17 | KGSL / DroidSpaces ARM64 runtime | ✅ **已完成** |
+| 18 | Anland consumer 真机 disconnect / reconnect | 🟡 **未做完整稳定性验证**：未做长时/多次重连的压力验证，不要视为已完成 |
+| 19 | Firefox 播放 | 🔴 **未解决，待继续排查**（见 §7 H/I） |
+| 20 | 麦克风 capture 真机录音 | 🔴 **未验证**：仓库中暂无真机录音证据 |
 
-> **重要说明**：下文中标记 🔴 的项目我**不会声称已完成**。第 10/11 项未做的原因已列明，且未改动任何 Rust 代码或有条件编译路径，风险集中在可确定性验证的 C 侧。
+> **重要说明**：
+>
+> 1. 标记 ⚪ 的第 10 项是**开发机限制**（无 Rust 工具链），不影响目标设备；ARM64 release
+>    构建已在目标设备完成（第 11 项）。
+> 2. 第 18～20 项仍未完成，请勿视为已验证。
+> 3. 本报告正文（§1–§6、§10）是 `ec9ef2f` 当时在 x86_64 开发机上的**历史分析记录**，
+>    未逐处改写；真机验证结论以本节和 §7 为准。
+> 4. 真机测试中另发现一个**独立的环境问题**（WirePlumber V4L2），见 §7 开头的说明。
 
 ---
 
@@ -814,9 +828,30 @@ ls -l target/release/niri
 
 ## 7. 测试流程
 
-> 🟢 = 本机 x86_64 沙箱可做的静态验证；🔴 = **必须在目标 ARM64 DroidSpaces 设备验证，本机无法代劳**。
+> 🟢 = 本机 x86_64 沙箱可做的静态验证；✅ = **已在目标 ARM64 DroidSpaces 设备验证通过**；
+> 🔴 = 仍未完成 / 待排查。
 
-### A / B / C — 构建、替换、重启
+### ⚠️ 独立的环境问题：WirePlumber `monitor.v4l2` 阻塞（**不是** ANiri audio backend 的问题）
+
+真机排查中发现，`pw-play` 长期停在 `connecting -> paused` 还有一个**与本次修复无关**的
+环境成因：
+
+- 在 DroidSpaces 环境下，WirePlumber 的 `monitor/v4l2/create-device` 的**异步 device
+  activation 会卡住**，阻塞 WirePlumber 的 event dispatcher；
+- dispatcher 被阻塞后，后续的音频 stream node **无法完成 session-item / link 创建**，
+  表现出的症状正是 `pw-play connecting -> paused`、link 停在 `[paused]`；
+- **临时禁用 WirePlumber 的 `monitor.v4l2` 之后，`pw-play` 立即恢复正常并实际出声。**
+
+**定性**：这是**目标运行环境 / WirePlumber 集成问题**，与 ANiri audio backend 的
+sender / framing / RT queue 修复**无关**。两者症状相似（都表现为 stream 停在 paused），
+排查时务必先用 `wpctl status` 确认 **link 是否真的被创建**：
+
+- link 存在但节点不运行 → 属于本次 ANiri 修复的范畴；
+- link 根本没被创建 → 优先怀疑这个 WirePlumber V4L2 阻塞问题。
+
+请**不要**把该 V4L2 阻塞归因到 ANiri backend 回归，也不要据此回退本次修复。
+
+### A / B / C — 构建、替换、重启 ✅
 
 ```bash
 # A. 备份
@@ -832,7 +867,7 @@ journalctl -u niri-anland.service -f -o cat
 
 启动日志中应出现：`anland: audio transport attached`。
 
-### D — 节点存在性 🔴
+### D — 节点存在性 ✅
 
 ```bash
 wpctl status -n
@@ -840,14 +875,14 @@ wpctl status -n
 # Sources: * anland-mic
 ```
 
-### E — 生成测试音频 🔴
+### E — 生成测试音频 ✅
 
 ```bash
 ffmpeg -f lavfi -i "sine=frequency=440:duration=10" -ar 48000 -ac 2 -sample_fmt s16 /tmp/test.wav
 # 或： sox -n -r 48000 -c 2 -b 16 /tmp/test.wav synth 10 sine 440
 ```
 
-### F — 播放 🔴
+### F — `pw-play` 播放 ✅
 
 ```bash
 pw-play -v --target anland-speaker /tmp/test.wav
@@ -856,18 +891,30 @@ pw-play -v --target anland-speaker /tmp/test.wav
 期望：`stream state changed connecting -> paused` **之后继续**进入 `paused -> streaming`。
 更直观的两条日志：`anland: speaker stream paused -> streaming`、`anland: playback streaming (real PCM)`。
 
-### G — `pw-top` 🔴
+**真机结果：✅ 通过。** `pw-play` 已能进入 `streaming`，48 kHz / stereo 测试音经
+`anland-speaker` → ANiri → Android consumer → 手机扬声器**实际出声**。
+
+### G — `pw-top` ✅
 
 ```bash
 pw-top
 ```
 
-| 节点 | 修复前 | 修复后期望 |
+| 节点 | 修复前 | 修复后（真机实测） |
 |---|---|---|
-| `anland-speaker` | `S`　`QUANT 0`　`RATE 0` | `R`　`QUANT` 非 0　`RATE 48000` |
-| `pw-play` | `S`　`QUANT 0`　`RATE 0` | `R`　`QUANT` 非 0　`RATE 48000` |
+| `anland-speaker` | `S`　`QUANT 0`　`RATE 0` | **`R`　`QUANT` 非 0　`RATE 48000` ✅** |
+| `pw-play` | `S`　`QUANT 0`　`RATE 0` | **`R`　`QUANT` 非 0　`RATE 48000` ✅** |
 
-### H / I — Firefox 🔴
+**真机结果：✅ 已验证。** 相关节点已进入 `R` 状态，`RATE` / `QUANT` 非 0。
+
+### H / I — Firefox 🔴 仍未解决
+
+> **Firefox 与 `pw-play` 是两个独立验证项，请勿混为一谈。**
+> `pw-play` → `anland-speaker` → Android 扬声器链路已真机验证通过（见 F / G / J）；
+> **Firefox 当前仍未出声，属于独立待排查项**，不代表 audio backend 修复失败。
+> 排查建议：先确认 Firefox 的 stream 是否被创建并 link 到 `anland-speaker`
+> （`wpctl status -n`），再排除上文的 WirePlumber V4L2 阻塞 / Firefox 自身 audio backend
+> 选择（PulseAudio vs PipeWire）等因素。
 
 播放视频后：
 
@@ -877,11 +924,13 @@ wpctl status -n
 # Firefox output_FR > Anland remote speaker:playback_FR   不能再是 [paused]
 ```
 
-### J — Android 实际出声 🔴（唯一真正的验收标准）
+### J — Android 实际出声 ✅（唯一真正的验收标准）
 
-`pw-play` 的 440 Hz 正弦应从**手机扬声器**听到；Firefox 视频有声音。
+- **`pw-play` 路径：✅ 已验证。** 48 kHz / stereo 测试音经
+  `anland-speaker` → ANiri → Android consumer → **手机扬声器实际出声**。
+- **Firefox 路径：🔴 仍未出声**，属独立后续排查项（见 H / I），不计入本项结论。
 
-### K — 停止 10 秒后再次播放 🔴
+### K — 停止 10 秒后再次播放 ✅
 
 ```bash
 sleep 10 && pw-play -v --target anland-speaker /tmp/test.wav
@@ -890,7 +939,7 @@ sleep 10 && pw-play -v --target anland-speaker /tmp/test.wav
 要求：**不需要**重启 Aniri / 重启 PipeWire / 重设默认设备。停止期间应看到
 `anland: playback silent, keep-alive started (N bytes)`，且空闲时 niri 进程 CPU 不应明显占用一个核心（见 §8）。
 
-### L — Android consumer 断开 / 重连 🔴
+### L — Android consumer 断开 / 重连 🟡 未做完整稳定性验证
 
 手机端 Anland app 切后台再回来，然后再次 `pw-play`。期望日志序列：
 
@@ -911,7 +960,7 @@ anland: audio playback format 48000 Hz, 2 ch, S16LE, quantum N
 | **CPU** | `always-process` 会让该 sink 在**无客户端连接时也参与调度**（这正是能进入 streaming 的前提）。静音路径成本 ≈ 每周期一次 `sendmsg`（默认 quantum 1024/48000 ≈ 47 次/秒，仅 8 字节头 + 最多 1920 字节负载）。空闲时应用 `pw-top` 确认 niri 的 CPU 占比；若偏高，可调小 `KEEPALIVE_FRAMES`（当前已只在 `play_attached` 后启用）。 |
 | **latency** | **无额外延迟**。真实 PCM 永远原样转发当前周期；静音仅在「本周期完全无数据」时使用，长度随协商 quantum（≤480 帧 ≈ 10 ms），不拼接、不补齐。 |
 | **silence traffic** | 仅在 `audio_fd >= 0` 且 consumer 已宣告 PLAYBACK 格式时发送，`detach` 立即停止。典型量级 < 100 KB/s，且**有界**（不随空闲时间增长）。 |
-| **Android reconnect** | `detach` 复位 `play_attached` / `pcm_seen` / `keepalive_on`；重连后必须等新的 `AUDIO_MSG_FORMAT(PLAYBACK)` 才恢复 keep-alive，**不会对旧 fd 空写**。serial 保护避免「旧 attachment 的失败拆掉新 attachment」。仍**未能真机验证**。 |
+| **Android reconnect** | `detach` 复位 `play_attached` / `pcm_seen` / `keepalive_on`；重连后必须等新的 `AUDIO_MSG_FORMAT(PLAYBACK)` 才恢复 keep-alive，**不会对旧 fd 空写**。serial 保护避免「旧 attachment 的失败拆掉新 attachment」。**仍未做完整的真机稳定性验证**（未做长时 / 多次重连压力测试），不要视为已验证。 |
 | **mic regression** | 低。capture 逻辑未改（仅加 NULL guard）。唯一可能影响点：`valid_format()` 对 CAPTURE 要求 `channels ∈ [1,2]`；若 Android consumer 宣告 **>2ch 的 mic**，该宣告会被拒并打印 `anland: ignoring invalid audio format ...`。此时放宽 `MAX_AUDIO_CHANNELS` 即可，日志可直接看出。 |
 | **RT-safe 日志** | 实时线程上有 3 处**边沿触发** `fprintf`（非严格 RT-safe）。频率极低（仅状态跳变），已在代码注释与提交说明中标注。若需更保守，可改为写 `volatile` 标志、由 main loop 统一打印。 |
 | **`always-process` 与 Dummy-Driver** | 之前观察到的「加规则后 `Dummy-Driver` 跑起来但 speaker 仍 `S / RATE 0`」已解释：那一步只让 **driver** 变 running；真正把数据送给 consumer 的是本补丁的 keep-alive，**两者缺一不可**。 |
@@ -1036,16 +1085,39 @@ sudo systemctl restart niri-anland.service
 | [`COMMIT.txt`](COMMIT.txt) | 提交哈希与标题 |
 | `ANLAND_AUDIO_FIX_REPORT.md` | 本报告 |
 
-## 附录 B：未能完成的验证项（明确声明）
+## 附录 B：验证状态（已按真机测试结果更新）
 
-以下项目**不能**在本报告中被视为已完成，必须部署到目标 ARM64 DroidSpaces 设备验证：
+### B.1 已在目标 ARM64 DroidSpaces 设备验证通过 ✅
 
-- Android 实际扬声器出声
-- `pw-play` 真机声音验证
-- Firefox 真机声音验证
-- `pw-play` / `anland-speaker` 真机进入 `streaming` 且 `pw-top` 显示 `R`
-- Anland consumer 真机 disconnect / reconnect
-- KGSL 真机验证
-- 完整 `cargo build`（本机无 Rust 工具链）与 aarch64 交叉编译（本机无对应工具链/sysroot）
+- ARM64 release 构建（已在目标设备成功编译出 release binary）
+- 新 ANiri binary 实际运行
+- `anland-speaker` / `anland-mic` 节点正常创建
+- PipeWire graph 进入运行态
+- `pw-play` 进入 `streaming`（不再永久停在 `paused`）
+- `pw-top` 中相关节点进入 `R` 状态，`RATE` / `QUANT` 非 0
+- 48 kHz / stereo 测试音经 `anland-speaker` → ANiri → Android consumer →
+  **手机扬声器实际出声**
+- KGSL / DroidSpaces ARM64 runtime
 
-本报告能够确定的是：**根因定位、上游语义对齐、C 侧严格编译通过、PipeWire 1.0.5/1.6.9 API 兼容性核对、并发与生命周期安全加固**。
+> 结论：**speaker / playback 主链路已真机验证成功。**
+
+### B.2 仍未完成，不得视为已验证 🔴
+
+- **Firefox 播放**：当前仍未出声，属**独立后续排查项**，与 `pw-play` 分开跟踪；
+  不代表 audio backend 修复失败（见 §7 H / I）。
+- **麦克风 capture 真机录音**：仓库中暂无真机录音证据，未验证。
+- **Anland consumer disconnect / reconnect**：未做长时 / 多次重连的稳定性验证。
+- **x86_64 本机 `cargo build`**：开发机无 Rust 工具链，未做（不影响目标设备）。
+
+### B.3 旁证：独立的环境问题
+
+真机排查中另定位到一个与本次修复无关的成因（详见 §7 开头）：WirePlumber 的
+`monitor/v4l2/create-device` 异步激活在 DroidSpaces 下会卡住并阻塞 event dispatcher，
+使后续 stream node 无法创建 session-item / link，症状同样是 `pw-play connecting -> paused`；
+禁用 `monitor.v4l2` 后恢复正常。**该问题属于运行环境 / WirePlumber 集成，不应归因到
+ANiri audio backend 的 sender / framing / RT queue 修复。**
+
+### B.4 本报告能够确定的部分
+
+**根因定位、上游语义对齐、C 侧严格编译通过、PipeWire 1.0.5/1.6.9 API 兼容性核对、
+并发与生命周期安全加固**，以及上列 B.1 的真机验证结论。

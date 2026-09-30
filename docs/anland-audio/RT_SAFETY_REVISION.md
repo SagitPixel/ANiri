@@ -146,8 +146,9 @@ period」，因为 framing 断言现在主要来自协议层，而不是对 sock
 | 原子变量无非原子直访（脚本审计 6 个 `_Atomic` 字段） | ✅ 0 处 |
 | RT callback 内无 `fprintf`/`strerror`/`pw_loop_update_timer`（脚本审计函数体） | ✅ 干净 |
 | 仅改动 `anland_audio.c` 一个文件 | ✅ |
-| `cargo build` / aarch64 交叉编译 | ❌ 本机无 Rust 工具链与 aarch64 sysroot |
-| Android 真机出声 / `pw-top` 进入 `R` / consumer 重连 | 🔴 需部署到目标 ARM64 DroidSpaces 设备验证 |
+| `cargo build` / aarch64 交叉编译 | ❌ 本机无 Rust 工具链与 aarch64 sysroot（ARM64 release 构建**已在目标设备完成**） |
+| Android 真机出声 / `pw-top` 进入 `R` | ✅ **已在目标 ARM64 DroidSpaces 设备验证通过** |
+| consumer 重连 | 🟡 未做完整稳定性验证 |
 
 部署与验证命令仍见
 [ANLAND_AUDIO_FIX_REPORT.md](ANLAND_AUDIO_FIX_REPORT.md) §10。
@@ -165,3 +166,10 @@ ec9ef2f  backend/anland: keep PipeWire speaker stream alive
 分支 `fix/anland-audio`。`89e6ceb` 仅修改
 [`src/backend/anland/c/anland_audio.c`](../../src/backend/anland/c/anland_audio.c)
 （+262 / −106），未触碰该文件之外的任何代码。
+
+> **真机验证状态更新（后续）**：上述「未完成的验证」是本次修订**当时**的快照。
+> speaker / playback 主链路已在目标 ARM64 DroidSpaces 设备验证通过（ARM64 release 构建、
+> 新 binary 运行、节点创建、`pw-play` 进入 `streaming`、`pw-top` `R`/`RATE`/`QUANT` 非 0、
+> Android 扬声器实际出声）。**Firefox 播放与 mic capture 仍未完成**，
+> disconnect/reconnect 未做稳定性验证。当前状态以
+> [README.md](README.md)「真机验证状态」一节为准。

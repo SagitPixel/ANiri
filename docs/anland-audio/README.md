@@ -34,8 +34,54 @@
 - 直接看 diff：`git show ec9ef2f`
 - 应用补丁到其它 checkout：`git am < 0001-backend-anland-keep-PipeWire-speaker-stream-alive.patch`
 
+## 真机验证状态（目标 ARM64 DroidSpaces 设备）
+
+### ✅ 已验证通过
+
+| 项 | 状态 |
+|---|---|
+| ARM64 release 构建 | ✅ 已在目标设备成功编译 |
+| 新 ANiri binary 实际运行 | ✅ |
+| `anland-speaker` / `anland-mic` 节点创建 | ✅ |
+| PipeWire graph 进入运行态 | ✅ |
+| **`pw-play` 真机播放** | ✅ **进入 `streaming`，不再永久停在 `paused`** |
+| **`pw-top` `R` / `RATE` / `QUANT` 非 0** | ✅ |
+| **Android 扬声器实际出声**（48 kHz / stereo） | ✅ |
+| KGSL / DroidSpaces ARM64 runtime | ✅ |
+
+> **结论：ANiri speaker / `pw-play` / ARM64 DroidSpaces playback 已真机验证成功。**
+
+### 🔴 仍未完成（不要视为已验证）
+
+| 项 | 状态 |
+|---|---|
+| **Firefox 播放** | 🔴 **仍未出声，独立待排查**（与 `pw-play` 分开跟踪，不代表 audio backend 修复失败） |
+| **麦克风 capture 真机录音** | 🔴 未验证（仓库中暂无真机录音证据） |
+| Anland consumer disconnect / reconnect | 🟡 未做长时 / 多次重连的稳定性验证 |
+| x86_64 本机 `cargo build` | ⚪ 开发机无 Rust 工具链，未做（不影响目标设备） |
+
+### ⚠️ 独立的环境问题：WirePlumber `monitor.v4l2` 阻塞（**不是** ANiri backend 的问题）
+
+真机排查中定位到 `pw-play` 长期 `connecting -> paused` 的另一个**独立**成因：
+
+- DroidSpaces 环境下，WirePlumber 的 `monitor/v4l2/create-device` 的**异步 device
+  activation 可能卡住**，阻塞 WirePlumber 的 event dispatcher；
+- dispatcher 被阻塞后，后续音频 stream node **无法完成 session-item / link 创建**，
+  症状同样是 `pw-play connecting -> paused`、link 停在 `[paused]`；
+- **临时禁用 `monitor.v4l2` 后，`pw-play` 立即恢复正常并实际出声。**
+
+**定性**：属于**目标运行环境 / WirePlumber 集成问题**，与 ANiri audio backend 的
+sender / framing / RT queue 修复**无关**。排查时请先用 `wpctl status` 区分：
+
+- **link 已创建但节点不运行** → 属于本次 ANiri 修复范畴；
+- **link 根本没被创建** → 优先怀疑该 WirePlumber V4L2 阻塞。
+
+请勿据此回退本次修复，也不要把 Firefox 未出声描述成 audio backend 修复失败。
+
+---
+
 ## 重要提示
 
-修复报告中的 Android 真机验证项（实际出声、`pw-top` 进入 `R`、consumer
-disconnect/reconnect）**尚未在目标 ARM64 DroidSpaces 设备上验证**，报告 §0
-与附录 B 已逐条标注。部署验证命令见报告 §10。
+各 revision 文档末尾若写有「未完成的验证」，那是**该次修订当时**记录的快照；
+**当前真机验证状态以本节的表格为准**。报告 §0 / §7 / 附录 B 已按真机结果更新；
+部署验证命令仍见报告 §10。

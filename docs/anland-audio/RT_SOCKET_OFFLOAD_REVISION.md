@@ -236,8 +236,10 @@ static void arm_tick(struct anland_audio *a)
 
 未完成的验证（与之前一致，不因本次修订而改变）：
 
-- ❌ `cargo build` / `cargo build --release`：本机无 Rust 工具链（MSRV 1.87），无 aarch64 sysroot
-- 🔴 Android 真机出声、`pw-top` 进入 `R`、consumer disconnect/reconnect、KGSL
+- ⚪ `cargo build` / `cargo build --release`：本机无 Rust 工具链（MSRV 1.87），无 aarch64 sysroot
+  （ARM64 release 构建已在目标设备完成）
+- ✅ Android 真机出声、`pw-top` 进入 `R`、KGSL —— **已真机验证通过**
+- 🟡 consumer disconnect/reconnect —— 未做完整稳定性验证
 
 ---
 
@@ -257,3 +259,10 @@ cfd31db  (origin/main)
 `4d17eff` 仅修改
 [`src/backend/anland/c/anland_audio.c`](../../src/backend/anland/c/anland_audio.c)
 （+535 / −299），未触碰该文件之外的任何代码。
+
+> **真机验证状态更新（后续）**：上述「未完成的验证」是本次修订**当时**的快照。
+> speaker / playback 主链路已在目标 ARM64 DroidSpaces 设备验证通过（ARM64 release 构建、
+> 新 binary 运行、节点创建、`pw-play` 进入 `streaming`、`pw-top` `R`/`RATE`/`QUANT` 非 0、
+> Android 扬声器实际出声）。**Firefox 播放与 mic capture 仍未完成**，
+> disconnect/reconnect 未做稳定性验证。当前状态以
+> [README.md](README.md)「真机验证状态」一节为准。
